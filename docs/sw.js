@@ -8,7 +8,7 @@
  * 캐시는 'pinyin-search-' 로 시작하는 이름만 만들고 지운다. 다른 이름의 캐시는 절대 건드리지 않는다.
  */
 const PREFIX = 'pinyin-search-';
-const SHELL = PREFIX + 'shell-v1';
+const SHELL = PREFIX + 'shell-v2';
 const RUNTIME = PREFIX + 'runtime-v1';
 const OWNED = [SHELL, RUNTIME]; // 이 워커가 관리하는 캐시 (data-*, meta 는 페이지 담당)
 
@@ -57,7 +57,8 @@ self.addEventListener('activate', (event) => {
 
 async function networkFirst(req) {
   try {
-    const res = await fetch(req);
+    // GitHub Pages 는 10분 브라우저 캐시를 걸어 두므로, 항상 서버에 확인(바뀐 게 없으면 304라 가벼움) → 재배포가 바로 반영
+    const res = await fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' });
     if (res && res.ok) {
       const copy = res.clone();
       caches.open(SHELL).then((cache) => cache.put(req, copy));
