@@ -297,7 +297,33 @@ main {
   vertical-align: 2px;
 }
 
+.meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 6px 0 0;
+  font-size: .88rem;
+  color: var(--ink-2);
+}
+
+.cl { color: var(--ink-2); }
+
+.en-toggle {
+  border: 0;
+  background: none;
+  padding: 2px 0;
+  color: var(--ink-3);
+  font-size: .85rem;
+  cursor: pointer;
+}
+
+.en-toggle:hover, .en-toggle[aria-expanded="true"] { color: var(--accent); }
+
+.sense-sep { color: var(--ink-3); margin: 0 6px; }
+
 .readings { margin: 8px 0 0; padding: 0; list-style: none; }
+.en-box { padding: 8px 10px; border-radius: 10px; background: var(--surface-2); }
 
 .readings li {
   display: flex;

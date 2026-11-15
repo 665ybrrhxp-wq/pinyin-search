@@ -66,6 +66,27 @@ function isBoundOrVariantDef(d) {
   return /^(old |archaic |ancient |obscure |Japanese |Taiwan |)variant of /i.test(d) || /^see [^ ]+\[/i.test(d);
 }
 
+/**
+ * CC-CEDICT 뜻 정리: 뜻 하나 안의 ';' 는 쉼표로, 양사 표기 "CL:個|个[ge4],件[jian4]" 는 따로 뽑아 ['个','件']
+ * 반환: { defs: [뜻...], cl: [양사...] }
+ */
+function cleanDefs(defs) {
+  const out = [];
+  const cl = [];
+  for (const d of defs || []) {
+    if (/^CL:/.test(d)) {
+      for (const item of d.slice(3).split(',')) {
+        const w = item.replace(/\[.*?\]/g, '').split('|').pop().trim();
+        if (w && !cl.includes(w)) cl.push(w);
+      }
+      continue;
+    }
+    const s = d.replace(/\s*;\s*/g, ', ').trim();
+    if (s) out.push(s);
+  }
+  return { defs: out, cl };
+}
+
 /** "Xi1 an1" → "xi an", "lu:4 se4" → "lv se" (성조 숫자·비음절 토큰 제거) — 색인 키 */
 function pinyinKey(py) {
   const k = py.toLowerCase().replace(/u:/g, 'v').replace(/ü/g, 'v').replace(/[1-5]/g, '');
@@ -236,7 +257,7 @@ class Dictionary {
       readings: readings.map((e) => ({
         trad: e.trad,
         syllables: e.syl.map((s) => ({ t: s.marked, tone: s.isSyl ? s.tone || 5 : 5 })),
-        defs: e.defs,
+        ...cleanDefs(e.defs),
         proper: e.proper,
       })),
       chars: this.charSummaries(first),
@@ -420,13 +441,19 @@ class Dictionary {
       return i >= 0 ? i : pos ? 50 : 99;
     };
     const sorted = [...groups].sort((a, b) => rank(a.pos) - rank(b.pos));
-    const [main, ...rest] = sorted;
+    // 위키낱말사전 풀이 안의 ';' 도 따로따로 나눔 ("~라고 생각하다; ~라는 의견을 가지다" → 두 항목)
+    const split = (g) => [...new Set(g.flatMap((x) => x.split(/\s*;\s*/)).map((x) => x.trim()).filter(Boolean))];
+    const [main, ...rest] = sorted.map((x) => ({ pos: x.pos, g: split(x.g) }));
     const alts = [];
     if (main.g.length > 3) alts.push({ pos: main.pos, terms: main.g.slice(3) });
     for (const r of rest) alts.push({ pos: r.pos, terms: r.g });
     // 제목줄에는 짧게 (긴 풀이는 말줄임 + 전체는 full 로 전달 → 툴팁)
     const full = main.g.slice(0, 3).join(', ');
-    const text = full.length > 48 ? full.slice(0, 46).replace(/[\s,;(]+$/u, '') + '…' : full;
+    const short = main.g
+      .slice(0, 3)
+      .map((x) => x.replace(/\s*\([^)]{12,}\)/g, '').trim()) // 긴 괄호 설명은 제목줄에서 생략
+      .join(', ');
+    const text = short.length > 48 ? short.slice(0, 46).replace(/[\s,;(]+$/u, '') + '…' : short;
     return {
       text,
       full,
@@ -588,7 +615,7 @@ class Dictionary {
         return {
           word: g.word,
           syllables: e.syl.map((s) => ({ t: s.marked, tone: s.isSyl ? s.tone || 5 : 5 })),
-          def: e.defs.slice(0, 2).join('; '),
+          def: cleanDefs(e.defs).defs.slice(0, 2).join(' · '),
         };
       });
   }

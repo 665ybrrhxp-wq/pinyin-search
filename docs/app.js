@@ -261,21 +261,30 @@ function groupCard(g) {
   card.className = 'card';
   card.dataset.word = g.word;
   card.dataset.py = pinyinText(r0.syllables);
-  card.dataset.en = (r0.defs || []).slice(0, 2).join('; ');
+  card.dataset.en = (r0.defs || []).slice(0, 2).join(', ');
 
-  const tradHTML =
-    g.trad && g.trad !== g.word ? `<span class="trad" lang="zh-Hant" title="번체자">繁 ${esc(g.trad)}</span> ` : '';
-  const readingsHTML =
-    g.readings.length === 1
-      ? `<ul class="readings"><li><span class="r-def">${tradHTML}${esc((r0.defs || []).join('; ') || '영어 뜻 없음')}</span></li></ul>`
-      : `<ul class="readings">${g.readings
-          .map(
-            (r) =>
-              `<li><span class="r-py">${pinyinHTML(r.syllables)}</span><span class="r-def">${
-                r.trad && r.trad !== g.word ? `<span class="trad" lang="zh-Hant">繁 ${esc(r.trad)}</span> ` : ''
-              }${esc((r.defs || []).join('; ') || '—')}</span></li>`,
-          )
-          .join('')}</ul>`;
+  // 늘 보이는 줄: 번체 · 양사 · [영어 뜻] 버튼
+  const cls = [...new Set(g.readings.flatMap((r) => r.cl || []))];
+  const metaBits = [];
+  if (g.trad && g.trad !== g.word) metaBits.push(`<span class="trad" lang="zh-Hant" title="번체자">繁 ${esc(g.trad)}</span>`);
+  if (cls.length) metaBits.push(`<span class="cl" title="이 명사에 쓰는 양사">양사 <span lang="zh-Hans">${esc(cls.join(', '))}</span></span>`);
+  metaBits.push(
+    `<button type="button" class="en-toggle" data-act="en" aria-expanded="false">영어 뜻 ${g.readings.length > 1 ? `(${g.readings.length}가지 발음) ` : ''}▾</button>`,
+  );
+  const sensesHTML = (defs) =>
+    (defs || []).length
+      ? defs.map((d) => `<span class="sense">${esc(d)}</span>`).join('<span class="sense-sep">·</span>')
+      : '<span class="sense">—</span>';
+  // 접힌 상자: 발음별 영어 뜻 (뜻 사이 ';' 대신 · 로 구분)
+  const enHTML = `<ul class="readings en-box" hidden>${g.readings
+    .map(
+      (r) =>
+        `<li>${g.readings.length > 1 ? `<span class="r-py">${pinyinHTML(r.syllables)}</span>` : ''}<span class="r-def">${
+          r.trad && r.trad !== g.trad ? `<span class="trad" lang="zh-Hant">繁 ${esc(r.trad)}</span> ` : ''
+        }${sensesHTML(r.defs)}</span></li>`,
+    )
+    .join('')}</ul>`;
+  const readingsHTML = `<div class="meta-row">${metaBits.join('<span class="sense-sep">·</span>')}</div>${enHTML}`;
 
   const ko = g.korean;
   card.innerHTML = `
@@ -691,6 +700,14 @@ function init() {
     if (t.dataset.stroke) return strokeAction(t.dataset.stroke);
     const card = t.closest('.card');
     if (card && t.dataset.act === 'speak') return speak(card.dataset.word);
+    if (card && t.dataset.act === 'en') {
+      const box = card.querySelector('.en-box');
+      const open = box.hidden;
+      box.hidden = !open;
+      t.setAttribute('aria-expanded', String(open));
+      t.textContent = t.textContent.replace(open ? '▾' : '▴', open ? '▴' : '▾');
+      return;
+    }
     if (card && t.dataset.act === 'copy') {
       const meaning = card.dataset.ko || card.dataset.en || '';
       return copyText(`${card.dataset.word} (${card.dataset.py}): ${meaning}`);
