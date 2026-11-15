@@ -352,6 +352,22 @@ main {
 .t4 { color: var(--t4); }
 .t5 { color: var(--t5); }
 
+/* ---------- 문장 카드 ---------- */
+.card.sentence { border-color: var(--accent); background: linear-gradient(var(--accent-weak), var(--surface) 70%); }
+.card.sentence .word { font-size: 1.7rem; letter-spacing: .04em; }
+.sent-py { margin: 2px 0 4px; font-size: 1.05rem; font-weight: 500; }
+.seg { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.seg-chip {
+  display: inline-flex; flex-direction: column; align-items: center;
+  border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 3px 10px; cursor: pointer;
+}
+.seg-chip:hover { border-color: var(--accent); }
+.seg-chip .w { font-size: 1.15rem; }
+.seg-chip .p { font-size: .76rem; }
+.seg-sep { color: var(--ink-3); }
+.card.flash { animation: flash 1.2s ease-out; }
+@keyframes flash { from { box-shadow: 0 0 0 3px var(--accent); } }
+
 .more-wrap { display: flex; justify-content: center; margin-top: 16px; }
 
 .more {

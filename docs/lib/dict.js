@@ -311,6 +311,64 @@ class Dictionary {
     return { parsed, groups, interpretations, toneRelaxed, invalid: parsed.invalid };
   }
 
+  /**
+   * 문장 병음 → 단어 나누기 (예: "wo jue de wo hai dei zai nu li" → 我 / 觉得 / 我 / 还 / 得 / 再 / 努力)
+   * 음절 구간마다 사전 단어를 후보로 놓고, 점수 합이 가장 큰 조합을 고름(비터비).
+   * imeSentence(입력기가 문장 전체를 바꾼 결과)가 있으면 같은 자리 글자와 일치하는 단어를 크게 우대.
+   * 각 단어의 발음은 사용자가 입력한 음절에서 정해지므로 다음자도 문맥대로 나옴 (还得 → 得 děi).
+   * 반환: { hanzi, words:[{ word, id, start, len }] } | null
+   */
+  searchSentence(q, { imeSentence } = {}) {
+    const parsed = parseQuery(q);
+    let best = null;
+    for (const seg of parsed.segmentations.slice(0, 6)) {
+      const n = seg.length;
+      if (n < 2) continue;
+      const ime = imeSentence && [...imeSentence].length === n ? [...imeSentence] : null;
+      const dp = new Array(n + 1).fill(null);
+      dp[0] = { score: 0 };
+      for (let i = 0; i < n; i++) {
+        if (!dp[i]) continue;
+        for (let len = 1; len <= Math.min(6, n - i); len++) {
+          const part = seg.slice(i, i + len);
+          const ids = this.byKey.get(part.map((s) => s.base).join(' '));
+          if (!ids) continue;
+          const imeStr = ime ? ime.slice(i, i + len).join('') : null;
+          let pick = null;
+          let pickScore = -Infinity;
+          for (const id of ids) {
+            const e = this.entry(id);
+            if (e.variantOnly) continue;
+            const syls = e.syl.filter((s) => s.isSyl);
+            if (!part.every((s, k) => !s.tone || (syls[k] && (syls[k].tone || 5) === s.tone))) continue;
+            // 단어 확률의 로그처럼 계산: 조각마다 음수가 붙어 잘게 쪼갤수록 손해 (觉+的 < 觉得)
+            // 고유명사(中国·北京·汉语)도 후보로 두고, 같은 단어의 발음끼리는 일반 점수로 가름 (东西 dōngxi)
+            let s = Math.log10(1 + this.wordFreq(e.simp)) * 10 - 75 + this.entryScore(e) * 0.05;
+            if (e.proper) s -= 3;
+            if (this.isSecondaryReading(e)) s -= 15;
+            if (this.hskLevel(e.simp)) s += 5;
+            if (imeStr && (e.simp === imeStr || e.trad === imeStr)) s += 60 * len; // 글자 수만큼 → 쪼개도 이득 없음
+            if (s > pickScore) {
+              pickScore = s;
+              pick = id;
+            }
+          }
+          if (pick == null) continue;
+          const total = dp[i].score + pickScore;
+          if (!dp[i + len] || total > dp[i + len].score) dp[i + len] = { score: total, prev: i, pick, len };
+        }
+      }
+      if (!dp[n]) continue;
+      const picks = [];
+      for (let k = n; k > 0; k = dp[k].prev) picks.unshift({ id: dp[k].pick, start: dp[k].prev, len: dp[k].len });
+      const avg = dp[n].score / n;
+      if (!best || avg > best.avg) best = { avg, picks };
+    }
+    if (!best) return null;
+    const words = best.picks.map((p) => ({ word: this.entry(p.id).simp, id: p.id, start: p.start, len: p.len }));
+    return { hanzi: words.map((w) => w.word).join(''), words };
+  }
+
   /** 한자 검색: 정확히 일치 → 포함 단어 */
   searchHanzi(q) {
     const text = [...q].filter((c) => HAN_RE.test(c)).join('');

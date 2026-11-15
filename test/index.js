@@ -385,3 +385,43 @@ describe('static-site integrity', () => {
     );
   });
 });
+
+describe('sentence segmentation', () => {
+  const { loadDictionary } = require('../scripts/node-dict');
+  let d;
+  before(() => {
+    d = loadDictionary();
+  });
+  const split = (q, ime) => {
+    const s = d.searchSentence(q, { imeSentence: ime });
+    return s.words.map((w) => w.word + '/' + d.entry(w.id).numbered).join(' ');
+  };
+
+  test('offline: wo jue de … splits into words with contextual readings (得 děi)', () => {
+    assert.equal(split('wo jue de wo hai dei zai nu li'), '我/wo3 觉得/jue2de5 我/wo3 还/hai2 得/dei3 在/zai4 努力/nu3li4');
+  });
+
+  test('offline: common sentences keep multi-syllable words', () => {
+    assert.equal(
+      d.searchSentence('jin tian tian qi hen hao').words.map((w) => w.word).join(' '),
+      '今天 天气 很 好',
+    );
+    assert.equal(
+      d.searchSentence('yin wei ta hen mang suo yi mei lai').words.map((w) => w.word).join(' '),
+      '因为 他 很 忙 所以 没 来',
+    );
+  });
+
+  test('IME sentence hint fixes homophones without over-splitting', () => {
+    assert.equal(split('wo jue de wo hai dei zai nu li', '我觉得我还得再努力'), '我/wo3 觉得/jue2de5 我/wo3 还/hai2 得/dei3 再/zai4 努力/nu3li4');
+    assert.equal(
+      d.searchSentence('wo xi huan chi zhong guo cai', { imeSentence: '我喜欢吃中国菜' }).hanzi,
+      '我喜欢吃中国菜',
+    );
+  });
+
+  test('single syllable or invalid input gives no sentence', () => {
+    assert.equal(d.searchSentence('ni'), null);
+    assert.equal(d.searchSentence('xyz'), null);
+  });
+});

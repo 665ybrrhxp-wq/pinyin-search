@@ -396,6 +396,46 @@ async function search(q, { offset = 0, limit = 20 } = {}) {
   if (!imeWords.length && parsed.imeText && (ime.lastError || !online())) {
     warnings.push(online() ? '입력기 순위를 못 받아 사전 빈도순으로 정렬했어요' : '오프라인이라 사전 빈도순으로 정렬했어요');
   }
+
+  // 한 단어로 맞는 게 없고 음절이 2개 이상이면 문장으로 보고 단어별로 나눔
+  const sylCount = (parsed.segmentations[0] || []).length;
+  if (!r.groups.length && sylCount >= 2) {
+    const imeTop = imeWords[0] && [...imeWords[0]].length >= 2 ? imeWords[0] : null;
+    const sent = dict.searchSentence(q, { imeSentence: imeTop });
+    if (sent) {
+      const marked = (id) => dict.entry(id).syl.map((s) => ({ t: s.marked, tone: s.isSyl ? s.tone || 5 : 5 }));
+      const groups = [];
+      const seen = new Set();
+      for (const w of sent.words) {
+        if (seen.has(w.word)) continue;
+        seen.add(w.word);
+        groups.push({ word: w.word, ids: [w.id], score: 0 }); // 문맥 속 발음 하나만 (还得 → 得 děi)
+      }
+      const usedIme = !!imeTop && sent.hanzi === imeTop;
+      if (!usedIme) {
+        warnings.push(
+          imeTop
+            ? `입력기 변환(${imeTop})과 다르게 나뉜 부분이 있어요`
+            : '입력기 변환 없이 사전으로만 나눠서 틀린 글자가 있을 수 있어요',
+        );
+      }
+      return paginate(
+        {
+          mode: 'sentence',
+          query: q,
+          warnings,
+          sentence: {
+            hanzi: sent.hanzi,
+            words: sent.words.map((w) => ({ word: w.word, syllables: marked(w.id) })),
+            korean: (await kv.get('ko:' + sent.hanzi, 180 * DAY)) || null,
+          },
+        },
+        groups,
+        offset,
+        limit,
+      );
+    }
+  }
   return paginate(
     { mode: 'pinyin', query: q, interpretations: r.interpretations, toneRelaxed: r.toneRelaxed, invalid: r.invalid, warnings },
     r.groups,

@@ -173,6 +173,10 @@ async function search(q, { push = true, offset = 0 } = {}) {
       renderStatus(data);
       saveHistory(q);
     }
+    if (offset === 0 && data.sentence) {
+      results.appendChild(sentenceCard(data.sentence));
+      if (!data.sentence.korean) queueMeanings([data.sentence.hanzi]);
+    }
     for (const g of data.groups) results.appendChild(groupCard(g));
     state.offset = offset + data.groups.length;
     state.total = data.total;
@@ -204,6 +208,8 @@ function renderStatus(data) {
     }
     parts.push(`<span>결과 ${data.total}개</span>`);
     if (data.toneRelaxed) parts.push(`<span class="warn">입력한 성조와 정확히 맞는 단어가 없어 성조를 무시한 결과예요</span>`);
+  } else if (data.mode === 'sentence') {
+    parts.push(`<span>문장으로 풀이 · 단어 ${data.total}개</span>`);
   } else if (data.mode === 'hanzi') {
     parts.push(`<span>한자 검색 · 결과 ${data.total}개</span>`);
   } else if (data.mode === 'korean') {
@@ -289,6 +295,36 @@ function groupCard(g) {
     ${readingsHTML}
     <div class="chars">${(g.chars || []).map(charChip).join('')}</div>`;
   if (ko) fillMeaning(card, ko);
+  return card;
+}
+
+/** 문장 카드: 한자 문장 + 병음 + 번역 + 단어 나눔 (단어 칩을 누르면 그 단어 카드로 이동) */
+function sentenceCard(s) {
+  const card = document.createElement('article');
+  card.className = 'card sentence';
+  card.dataset.word = s.hanzi;
+  card.dataset.py = s.words.map((w) => pinyinText(w.syllables).replace(/ /g, '')).join(' ');
+  card.dataset.en = '';
+  card.innerHTML = `
+    <div class="card-head">
+      <div class="actions">
+        <button type="button" class="icon-btn" data-act="speak" aria-label="문장 발음 듣기" title="문장 발음 듣기">🔊</button>
+        <button type="button" class="icon-btn" data-act="copy" aria-label="복사" title="'문장 (병음): 뜻' 형식으로 복사">⧉</button>
+      </div>
+      <p class="headline"><span class="word" lang="zh-Hans">${esc(s.hanzi)}</span></p>
+    </div>
+    <p class="sent-py">${s.words
+      .map((w) => `<span class="sent-w">${pinyinHTML(w.syllables).replace(/> </g, '><')}</span>`)
+      .join(' ')}</p>
+    <p class="headline"><span class="ko ${s.korean ? '' : 'pending'}" data-ko>${s.korean ? esc(s.korean.text) : '번역 불러오는 중…'}</span></p>
+    <p class="ko-alts" data-alts hidden></p>
+    <div class="seg">${s.words
+      .map(
+        (w) => `<button type="button" class="seg-chip" data-jump="${esc(w.word)}" title="${esc(w.word)} 풀이로 이동">
+          <span class="w" lang="zh-Hans">${esc(w.word)}</span><span class="p">${pinyinHTML(w.syllables)}</span></button>`,
+      )
+      .join('<span class="seg-sep">/</span>')}</div>`;
+  if (s.korean) fillMeaning(card, s.korean);
   return card;
 }
 
@@ -641,6 +677,16 @@ function init() {
       return openChar(t.dataset.char, t.dataset.trad);
     }
     if (t.matches('.comp')) return openChar(t.dataset.char);
+    if (t.dataset.jump) {
+      const target = document.querySelector(`.card:not(.sentence)[data-word="${CSS.escape(t.dataset.jump)}"]`);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.remove('flash');
+        void target.offsetWidth;
+        target.classList.add('flash');
+      }
+      return;
+    }
     if (t.dataset.speak) return speak(t.dataset.speak);
     if (t.dataset.stroke) return strokeAction(t.dataset.stroke);
     const card = t.closest('.card');
