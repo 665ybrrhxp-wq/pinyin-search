@@ -240,8 +240,10 @@ class Dictionary {
   serializeGroup(g) {
     const hsk = this.hsk[g.word] || null;
     const hskPy = new Set((hsk && hsk.py) || []);
-    const readings = g.ids
-      .map((id) => this.entry(id))
+    let entries = g.ids.map((id) => this.entry(id));
+    // 실제 뜻이 있는 항목이 있으면 '이체자(variant of …)'뿐인 항목은 뺌 (是 의 昰 같은 것)
+    if (entries.some((e) => !e.variantOnly)) entries = entries.filter((e) => !e.variantOnly);
+    const readings = entries
       .sort((a, b) => {
         const am = hskPy.has(a.numbered) ? 1 : 0;
         const bm = hskPy.has(b.numbered) ? 1 : 0;
