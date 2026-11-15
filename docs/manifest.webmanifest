@@ -1,0 +1,16 @@
+{
+  "name": "병음 사전 · TSC",
+  "short_name": "병음사전",
+  "description": "병음으로 중국어 단어를 찾고, 한자별 훈음·부수·획순을 보는 학습용 사전",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#faf8f5",
+  "theme_color": "#c2410c",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

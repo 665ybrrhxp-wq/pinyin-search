@@ -1,0 +1,17 @@
+{
+  "name": "pinyin-search",
+  "version": "1.0.0",
+  "private": true,
+  "description": "병음으로 찾는 중국어 사전 — 한자 훈음·부수·획순 (TSC 학습용)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js --open",
+    "serve": "node server.js",
+    "build-data": "node scripts/build-data.js",
+    "rebuild-data": "node scripts/build-data.js --force",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>병음 사전 · TSC</title>
+  <meta name="description" content="병음으로 중국어 단어를 찾고, 한자별 훈음·부수·획순을 보는 학습용 사전">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#c2410c">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="병음사전">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="./" aria-label="처음으로">
+      <span class="logo" lang="zh-Hans">拼</span>
+      <span class="brand-text">
+        <strong>병음 사전</strong>
+        <small>병음으로 찾는 중국어 단어 · 한자 훈음 · 부수 · 획순</small>
+      </span>
+    </a>
+  </header>
+
+  <main>
+    <form id="search-form" class="search" role="search" autocomplete="off">
+      <input id="q" name="q" type="search" spellcheck="false" autocapitalize="off" autocorrect="off" enterkeyhint="search"
+             placeholder="병음 입력 — ben zi, xihuan, xi3 huan, 喜欢"
+             aria-label="병음 또는 한자 검색어">
+      <button type="submit" class="search-btn">검색</button>
+    </form>
+
+    <div class="chips-row" id="examples">
+      <span class="row-label">예시</span>
+      <button type="button" class="chip" data-q="ben zi">ben zi</button>
+      <button type="button" class="chip" data-q="xi huan">xi huan</button>
+      <button type="button" class="chip" data-q="dasuan">dasuan</button>
+      <button type="button" class="chip" data-q="dong xi">dong xi</button>
+      <button type="button" class="chip" data-q="pian2 yi">pian2 yi</button>
+      <button type="button" class="chip" data-q="lv se">lv se</button>
+    </div>
+    <div class="chips-row" id="history" hidden></div>
+
+    <p class="tip">
+      성조는 숫자(<code>xi3</code>)나 부호(<code>xǐ</code>)로 좁힐 수 있어요 · ü는 <code>v</code>로(<code>lv</code>) ·
+      띄어쓰기는 선택 · 한자나 한국어(<code>좋아하다</code>)로도 찾을 수 있어요
+    </p>
+
+    <section id="status" class="status" aria-live="polite"></section>
+    <section id="results" class="results"></section>
+    <div class="more-wrap"><button type="button" id="more" class="more" hidden>결과 더 보기</button></div>
+  </main>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="drawer" class="drawer" hidden aria-labelledby="drawer-title" role="dialog" aria-modal="true">
+    <div class="drawer-head">
+      <h2 id="drawer-title">한자 정보</h2>
+      <button type="button" class="icon-btn" id="drawer-close" aria-label="닫기">✕</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+
+  <footer class="foot">
+    <p>
+      데이터(가공해서 사용): <a href="https://www.mdbg.net/chinese/dictionary?page=cc-cedict" target="_blank" rel="noopener">CC-CEDICT</a> (CC BY-SA 4.0) ·
+      <a href="https://github.com/skishore/makemeahanzi" target="_blank" rel="noopener">Make Me a Hanzi</a> (LGPL-3.0) ·
+      <a href="https://www.unicode.org/charts/unihan.html" target="_blank" rel="noopener">Unihan</a> ·
+      <a href="https://github.com/libhangul/libhangul" target="_blank" rel="noopener">libhangul 한자 사전</a> (BSD-3) ·
+      <a href="https://ko.wiktionary.org" target="_blank" rel="noopener">한국어 위키낱말사전</a> (CC BY-SA 4.0) ·
+      <a href="https://github.com/drkameleon/complete-hsk-vocabulary" target="_blank" rel="noopener">HSK 어휘</a> ·
+      <a href="https://github.com/fxsjy/jieba" target="_blank" rel="noopener">jieba</a> ·
+      <a href="https://hanziwriter.org" target="_blank" rel="noopener">Hanzi Writer</a>
+      · <a href="https://github.com/665ybrrhxp-wq/pinyin-search/blob/main/DATA-LICENSES.md" target="_blank" rel="noopener">출처·라이선스 전문</a>
+    </p>
+    <p>한국어 뜻은 위키낱말사전 풀이를 먼저 쓰고, 없으면 무료 번역 API 결과를 <b>자동 번역</b> 표시와 함께 보여 줍니다(참고용). 사전 데이터는 처음 한 번 받은 뒤 이 기기에 저장되어 오프라인에서도 검색됩니다.</p>
+    <p id="engine" class="engine"></p>
+  </footer>
+
+  <script src="vendor/hanzi-writer.min.js" defer></script>
+  <script src="lib/pinyin.js" defer></script>
+  <script src="lib/dict.js" defer></script>
+  <script src="lib/service.js" defer></script>
+  <script src="app.js" defer></script>
+</body>
+</html>
