@@ -68,26 +68,67 @@ if ('speechSynthesis' in window) {
   speechSynthesis.addEventListener?.('voiceschanged', pickVoice);
 }
 
-let ttsAudio = null;
+/*
+ * 발음: 온라인이면 음성 파일(Google TTS mp3)을 먼저 재생하고, 오프라인이거나 실패하면 기기 음성(speechSynthesis).
+ * 아이폰은 무음 스위치가 켜져 있으면 speechSynthesis 소리가 안 나고, cancel() 직후 speak() 를 무시하는
+ * WebKit 버그도 있어 오류 없이 조용히 실패함 → 음성 파일(무음 모드에서도 재생됨)을 우선 사용.
+ * 오디오 요소는 하나를 재사용 (iOS 는 사용자 터치 안에서 play() 해야 하므로 클릭 처리에서 바로 호출).
+ */
+const ttsAudio = new Audio();
+ttsAudio.preload = 'auto';
+
 function speak(text) {
   if (!text) return;
-  if (zhVoice) {
-    const u = new SpeechSynthesisUtterance(text);
-    u.voice = zhVoice;
-    u.lang = zhVoice.lang;
-    u.rate = 0.8;
-    speechSynthesis.cancel();
-    speechSynthesis.speak(u);
-    return;
-  }
-  // 브라우저에 중국어 음성이 없으면 Google TTS 음성 파일로 재생
   try {
-    ttsAudio?.pause();
+    if (navigator.audioSession) navigator.audioSession.type = 'playback'; // Safari 16.4+: 무음 모드에서도 재생
   } catch {
     /* noop */
   }
-  ttsAudio = new Audio(svc.ttsUrl(text));
-  ttsAudio.play().catch(() => toast('발음을 재생할 수 없어요 (중국어 음성 없음)'));
+  if (navigator.onLine === false) return speakWithDevice(text);
+  let settled = false;
+  const fallback = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    speakWithDevice(text);
+  };
+  const ok = () => {
+    settled = true;
+    cleanup();
+  };
+  const timer = setTimeout(fallback, 4000);
+  function cleanup() {
+    clearTimeout(timer);
+    ttsAudio.removeEventListener('playing', ok);
+    ttsAudio.removeEventListener('error', fallback);
+  }
+  ttsAudio.addEventListener('playing', ok);
+  ttsAudio.addEventListener('error', fallback);
+  try {
+    ttsAudio.pause();
+    ttsAudio.src = svc.ttsUrl(text);
+    const p = ttsAudio.play();
+    if (p && p.catch) p.catch(fallback);
+  } catch {
+    fallback();
+  }
+}
+
+function speakWithDevice(text) {
+  if (!('speechSynthesis' in window)) return toast('이 기기에서는 발음을 재생할 수 없어요');
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'zh-CN'; // 음성 목록을 못 받아도 lang 만으로 기기의 중국어 음성을 고름
+  if (zhVoice) u.voice = zhVoice;
+  u.rate = 0.8;
+  u.onerror = (e) => {
+    if (e.error !== 'canceled' && e.error !== 'interrupted') toast('발음을 재생할 수 없어요 (무음 모드·음량을 확인해 주세요)');
+  };
+  if (speechSynthesis.speaking || speechSynthesis.pending) {
+    speechSynthesis.cancel();
+    setTimeout(() => speechSynthesis.speak(u), 60); // cancel 직후 바로 speak 하면 Safari 가 무시함
+  } else {
+    speechSynthesis.speak(u);
+  }
 }
 
 async function copyText(text) {
