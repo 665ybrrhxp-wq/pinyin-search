@@ -425,3 +425,25 @@ describe('sentence segmentation', () => {
     assert.equal(d.searchSentence('xyz'), null);
   });
 });
+
+describe('hanzi sentence segmentation', () => {
+  const { loadDictionary } = require('../scripts/node-dict');
+  let d;
+  before(() => {
+    d = loadDictionary();
+  });
+  const words = (q) => d.segmentHanzi(q).words.map((w) => w.word).join(' ');
+
+  test('splits a hanzi sentence into dictionary words, skipping punctuation', () => {
+    assert.equal(words('我觉得我还得再努力'), '我 觉得 我 还 得 再 努力');
+    assert.equal(words('我喜欢吃中国菜。'), '我 喜欢 吃 中国 菜');
+  });
+
+  test('traditional input is mapped to simplified words', () => {
+    assert.equal(words('因為他很忙，所以沒來'), '因为 他 很 忙 所以 没 来');
+  });
+
+  test('single character gives no sentence', () => {
+    assert.equal(d.segmentHanzi('学'), null);
+  });
+});

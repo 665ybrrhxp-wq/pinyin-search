@@ -368,12 +368,73 @@ async function paginate(payload, groups, offset, limit) {
   return { ...payload, total: groups.length, offset, groups: slice };
 }
 
+/** 문장 결과 (병음 문장·한자 문장 공통): 문장 카드 + 단어별 카드 (단어마다 문맥 속 발음 하나) */
+async function sentenceResult(q, sent, warnings, offset, limit) {
+  const marked = (w) => {
+    if (w.id != null) return dict.entry(w.id).syl.map((s) => ({ t: s.marked, tone: s.isSyl ? s.tone || 5 : 5 }));
+    const r = (dict.charInfo(w.word) || {}).readings || []; // 사전에 없는 글자
+    return [{ t: r[0] ? r[0].t : '?', tone: r[0] ? r[0].tone : 5 }];
+  };
+  const groups = [];
+  const seen = new Set();
+  for (const w of sent.words) {
+    if (w.id == null || seen.has(w.word)) continue;
+    seen.add(w.word);
+    groups.push({ word: w.word, ids: [w.id], score: 0 });
+  }
+  return paginate(
+    {
+      mode: 'sentence',
+      query: q,
+      warnings,
+      sentence: {
+        hanzi: sent.hanzi,
+        words: sent.words.map((w) => ({ word: w.word, syllables: marked(w) })),
+        korean: (await kv.get('ko:' + sent.hanzi, 180 * DAY)) || null,
+      },
+    },
+    groups,
+    offset,
+    limit,
+  );
+}
+
 async function search(q, { offset = 0, limit = 20 } = {}) {
   await init();
   q = String(q || '').trim().slice(0, 80);
   if (!q) return { mode: 'pinyin', total: 0, offset: 0, groups: [] };
 
-  if (HAN_RE.test(q)) return paginate({ mode: 'hanzi', query: q }, dict.searchHanzi(q).groups, offset, limit);
+  if (HAN_RE.test(q)) {
+    const han = [...q].filter((c) => HAN_RE.test(c));
+    // 사전에 통째로 없는 2글자 이상 → 문장으로 보고 단어별로 나눔 (我觉得我还得再努力)
+    if (han.length >= 2 && !dict.exactIds(han.join('')).length) {
+      const sent = dict.segmentHanzi(q);
+      if (sent) {
+        // 읽는 법이 여러 개인 단어만 골라 알려 줌 (한자만으로는 문맥 속 발음을 확정할 수 없음)
+        const ambiguous = [
+          ...new Set(
+            sent.words
+              .filter((w) => w.id != null)
+              .filter((w) => {
+                const readings = new Set(
+                  dict.exactIds(w.word).map((id) => dict.entry(id)).filter((e) => !e.variantOnly).map((e) => e.numbered),
+                );
+                return readings.size > 1;
+              })
+              .map((w) => w.word),
+          ),
+        ];
+        const warnings = ambiguous.length
+          ? [`읽는 법이 여러 개인 글자(${ambiguous.join(', ')})는 문맥과 다른 발음으로 나올 수 있어요`]
+          : [];
+        return sentenceResult(q, sent, warnings, offset, limit);
+      }
+    }
+    const payload = { mode: 'hanzi', query: q };
+    // 한 글자 → 맨 위에 그 글자의 훈음·부수·획수 카드
+    if (han.length === 1 && offset === 0) payload.char = dict.charInfo(han[0]);
+    return paginate(payload, dict.searchHanzi(q).groups, offset, limit);
+  }
 
   if (HANGUL_RE.test(q)) {
     const translations = await koreanToChinese(q);
@@ -403,14 +464,6 @@ async function search(q, { offset = 0, limit = 20 } = {}) {
     const imeTop = imeWords[0] && [...imeWords[0]].length >= 2 ? imeWords[0] : null;
     const sent = dict.searchSentence(q, { imeSentence: imeTop });
     if (sent) {
-      const marked = (id) => dict.entry(id).syl.map((s) => ({ t: s.marked, tone: s.isSyl ? s.tone || 5 : 5 }));
-      const groups = [];
-      const seen = new Set();
-      for (const w of sent.words) {
-        if (seen.has(w.word)) continue;
-        seen.add(w.word);
-        groups.push({ word: w.word, ids: [w.id], score: 0 }); // 문맥 속 발음 하나만 (还得 → 得 děi)
-      }
       const usedIme = !!imeTop && sent.hanzi === imeTop;
       if (!usedIme) {
         warnings.push(
@@ -419,21 +472,7 @@ async function search(q, { offset = 0, limit = 20 } = {}) {
             : '입력기 변환 없이 사전으로만 나눠서 틀린 글자가 있을 수 있어요',
         );
       }
-      return paginate(
-        {
-          mode: 'sentence',
-          query: q,
-          warnings,
-          sentence: {
-            hanzi: sent.hanzi,
-            words: sent.words.map((w) => ({ word: w.word, syllables: marked(w.id) })),
-            korean: (await kv.get('ko:' + sent.hanzi, 180 * DAY)) || null,
-          },
-        },
-        groups,
-        offset,
-        limit,
-      );
+      return sentenceResult(q, sent, warnings, offset, limit);
     }
   }
   return paginate(

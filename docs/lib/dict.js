@@ -392,6 +392,49 @@ class Dictionary {
     return { hanzi: words.map((w) => w.word).join(''), words };
   }
 
+  /**
+   * 한자 문장 → 단어 나누기 (예: 我觉得我还得再努力 → 我 / 觉得 / 我 / 还 / 得 / 再 / 努力)
+   * 병음 문장과 같은 방식(단어 빈도의 로그 합이 최대인 조합). 한자가 아닌 문자(문장부호 등)는 건너뜀.
+   * 발음은 한자만으로는 정할 수 없으니 그 단어의 주된 발음을 고름 → 다음자(得 děi 등)는 틀릴 수 있음.
+   * 반환: { hanzi, words:[{ word, id|null }] } | null — 사전에 없는 글자는 id null
+   */
+  segmentHanzi(text) {
+    const chars = [...String(text)].filter((c) => HAN_RE.test(c));
+    const n = chars.length;
+    if (n < 2) return null;
+    const dp = new Array(n + 1).fill(null);
+    dp[0] = { score: 0 };
+    for (let i = 0; i < n; i++) {
+      if (!dp[i]) continue;
+      for (let len = 1; len <= Math.min(8, n - i); len++) {
+        const w = chars.slice(i, i + len).join('');
+        let pick = null;
+        let pickScore = -Infinity;
+        for (const id of this.exactIds(w)) {
+          const e = this.entry(id);
+          if (e.variantOnly) continue;
+          let s = Math.log10(1 + this.wordFreq(e.simp)) * 10 - 75 + this.entryScore(e) * 0.05;
+          if (this.isSecondaryReading(e)) s -= 15;
+          if (e.proper) s -= 3;
+          if (s > pickScore) {
+            pickScore = s;
+            pick = id;
+          }
+        }
+        if (pick == null && len === 1) pickScore = -120; // 사전에 없는 글자도 한 글자로는 지나가게
+        else if (pick == null) continue;
+        const total = dp[i].score + pickScore;
+        if (!dp[i + len] || total > dp[i + len].score) dp[i + len] = { score: total, prev: i, pick, word: w };
+      }
+    }
+    const words = [];
+    for (let k = n; k > 0; k = dp[k].prev) {
+      const p = dp[k];
+      words.unshift({ word: p.pick != null ? this.entry(p.pick).simp : p.word, id: p.pick });
+    }
+    return { hanzi: words.map((w) => w.word).join(''), words };
+  }
+
   /** 한자 검색: 정확히 일치 → 포함 단어 */
   searchHanzi(q) {
     const text = [...q].filter((c) => HAN_RE.test(c)).join('');

@@ -214,6 +214,10 @@ async function search(q, { push = true, offset = 0 } = {}) {
       renderStatus(data);
       saveHistory(q);
     }
+    if (offset === 0 && data.char) {
+      results.appendChild(charCard(data.char));
+      queueMeanings([data.char.c]);
+    }
     if (offset === 0 && data.sentence) {
       results.appendChild(sentenceCard(data.sentence));
       if (!data.sentence.korean) queueMeanings([data.sentence.hanzi]);
@@ -345,6 +349,58 @@ function groupCard(g) {
     ${readingsHTML}
     <div class="chars">${(g.chars || []).map(charChip).join('')}</div>`;
   if (ko) fillMeaning(card, ko);
+  return card;
+}
+
+/** 한자 한 글자 검색 시 맨 위에 보여 주는 글자 카드 (훈음·부수·획수·구성 요약, 자세히는 서랍) */
+function charCard(info) {
+  const r = info.radical;
+  const card = document.createElement('article');
+  card.className = 'card char-card';
+  card.dataset.word = info.c;
+  card.dataset.py = (info.readings || []).map((p) => p.t).join(', ');
+  card.dataset.en = info.definition || '';
+  const rows = [];
+  const hun = (info.hunSources || [])
+    .map((h) => `<span lang="zh-Hant">${esc(h.char)}</span> ${esc(h.hun.slice(0, 4).join(' / '))}`)
+    .join('<br>');
+  rows.push(['훈음', hun || '—']);
+  if (r) {
+    const bits = [`<b lang="zh-Hans">${esc(r.form)}</b>${r.form !== r.char ? `(<span lang="zh-Hant">${esc(r.char)}</span>)` : ''} ${esc(r.label)}`];
+    if (r.positionLabel) bits.push(esc(r.positionLabel));
+    if (r.num) bits.push(`제${r.num}부수`);
+    rows.push(['부수', bits.join(' · ')]);
+  }
+  if (info.strokes) rows.push(['획수', `총 ${info.strokes}획${info.extraStrokes != null ? ` (부수 외 ${info.extraStrokes}획)` : ''}`]);
+  const comps = info.decomposition?.components || [];
+  if (comps.length) {
+    const op = IDS_KO[[...(info.decomposition.ids || '')][0]];
+    rows.push([
+      '구성',
+      comps.map((x) => `<button type="button" class="comp" data-char="${esc(x)}" lang="zh-Hans">${esc(x)}</button>`).join(' + ') +
+        (op ? ` <span class="legend">${op}</span>` : ''),
+    ]);
+  }
+  if (info.etymology?.type) rows.push(['자원', esc(ETYM_KO[info.etymology.type] || info.etymology.type)]);
+  card.innerHTML = `
+    <div class="card-head">
+      <div class="actions">
+        <button type="button" class="icon-btn" data-act="speak" aria-label="발음 듣기" title="발음 듣기">🔊</button>
+        <button type="button" class="icon-btn" data-act="copy" aria-label="복사" title="'한자 (병음): 뜻' 형식으로 복사">⧉</button>
+      </div>
+      <div class="hero">
+        <div class="hero-char" lang="zh-Hans">${esc(info.c)}</div>
+        <div class="hero-info">
+          <div class="hero-py">${(info.readings || []).map((p) => `<span class="t${p.tone || 5}">${esc(p.t)}</span>`).join(' · ') || '—'}</div>
+          <div class="hero-hun">${esc((info.hun || [])[0] || '훈음 정보 없음')}</div>
+          <div class="hero-trad">${info.traditional?.length ? `번체 <span lang="zh-Hant">${esc(info.traditional.join(' '))}</span>` : ''}</div>
+        </div>
+      </div>
+    </div>
+    <p class="headline"><span class="ko pending" data-ko>뜻 불러오는 중…</span></p>
+    <p class="ko-alts" data-alts hidden></p>
+    <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+    <div class="meta-row"><button type="button" class="char-open" data-open-char="${esc(info.c)}">✎ 획순·자세히 보기</button></div>`;
   return card;
 }
 
@@ -727,6 +783,10 @@ function init() {
       return openChar(t.dataset.char, t.dataset.trad);
     }
     if (t.matches('.comp')) return openChar(t.dataset.char);
+    if (t.dataset.openChar) {
+      state.lastChip = t;
+      return openChar(t.dataset.openChar);
+    }
     if (t.dataset.jump) {
       const target = document.querySelector(`.card:not(.sentence)[data-word="${CSS.escape(t.dataset.jump)}"]`);
       if (target) {

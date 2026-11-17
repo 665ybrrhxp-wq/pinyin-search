@@ -378,6 +378,21 @@ main {
 .t4 { color: var(--t4); }
 .t5 { color: var(--t5); }
 
+/* ---------- 한 글자 카드 ---------- */
+.char-card { border-color: var(--accent); }
+.char-card .hero-char { font-size: 3.8rem; }
+.char-card .kv { margin-top: 10px; }
+.char-open {
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: var(--surface);
+  border-radius: 999px;
+  padding: 4px 14px;
+  font-size: .88rem;
+  cursor: pointer;
+}
+.char-open:hover { background: var(--accent-weak); }
+
 /* ---------- 문장 카드 ---------- */
 .card.sentence { border-color: var(--accent); background: linear-gradient(var(--accent-weak), var(--surface) 70%); }
 .card.sentence .word { font-size: 1.7rem; letter-spacing: .04em; }
