@@ -23,6 +23,8 @@ const http = require('http');
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     if (String(url).startsWith('https://gemini.fake')) {
+      // FAKE_DELAY_MS: 느린 응답 흉내 (기다리는 시간 표시·시간 제한 확인용)
+      if (process.env.FAKE_DELAY_MS) await new Promise((r) => setTimeout(r, Number(process.env.FAKE_DELAY_MS)));
       const text = process.env.FAKE_TEXT || '我每天早上七点起床，\n然后去公司上班。';
       return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }] }), {
         headers: { 'Content-Type': 'application/json' },
