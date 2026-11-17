@@ -206,6 +206,21 @@ async function handle(request, env, cors) {
   const url = new URL(request.url);
 
   if (url.pathname === '/health' && request.method === 'GET') {
+    // 키가 실제로 통하는지 모델 목록 조회로 확인 (키 값은 절대 내보내지 않음)
+    let keyCheck = null;
+    if (env.GEMINI_API_KEY) {
+      try {
+        const res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models?pageSize=1000`, {
+          headers: { 'x-goog-api-key': env.GEMINI_API_KEY },
+        });
+        const data = await res.json().catch(() => ({}));
+        keyCheck = res.ok
+          ? { ok: true, models: (data.models || []).length }
+          : { ok: false, status: res.status, error: (data.error && data.error.message) || `HTTP ${res.status}` };
+      } catch (err) {
+        keyCheck = { ok: false, error: err.message };
+      }
+    }
     return json(
       {
         ok: true,
@@ -214,6 +229,7 @@ async function handle(request, env, cors) {
           passwords: parsePasswords(env).length,
           usageStore: !!env.OCR_USAGE,
         },
+        keyCheck,
         model: env.GEMINI_API_KEY ? await resolveModel(env) : null,
       },
       200,

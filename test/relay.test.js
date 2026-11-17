@@ -85,6 +85,9 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
         throw new Error(`Network access forbidden: ${url.href}`);
       }
       if (request.method === 'GET' && url.pathname === '/v1beta/models' && url.search) {
+        if (request.headers.get('x-goog-api-key') === 'bad-key') {
+          return jsonResponse({ error: { message: 'API key not valid. Please pass a valid API key.' } }, 400);
+        }
         return jsonResponse({
           models: [
             { name: 'models/gemini-9.0-flash', supportedGenerationMethods: ['generateContent'] },
@@ -173,11 +176,26 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     for (const secret of [settings.GEMINI_API_KEY, settings.ACCESS_PASSWORDS, 'pw-one', 'pw-two']) {
       assert.ok(!text.includes(secret), `Health response must not contain secret ${secret}`);
     }
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].method, 'GET');
-    assert.equal(new URL(requests[0].url).pathname, '/v1beta/models');
-    assert.equal(requests[0].headers.get('x-goog-api-key'), 'k-test');
-    assert.ok(!requests[0].url.includes('k-test'), 'API key belongs in the header, not the URL');
+    // 키 점검(모델 목록 조회) 1번 + 모델 자동 선택 1번
+    assert.deepEqual(data.keyCheck, { ok: true, models: 4 });
+    assert.equal(requests.length, 2);
+    for (const r of requests) {
+      assert.equal(r.method, 'GET');
+      assert.equal(new URL(r.url).pathname, '/v1beta/models');
+      assert.equal(r.headers.get('x-goog-api-key'), 'k-test');
+      assert.ok(!r.url.includes('k-test'), 'API key belongs in the header, not the URL');
+    }
+  });
+
+  test('GET /health reports an invalid Gemini key without leaking it', async () => {
+    const response = await worker.fetch(req('/health'), env({ GEMINI_API_KEY: 'bad-key', GEMINI_MODEL: MODEL }));
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    const data = JSON.parse(text);
+    assert.equal(data.keyCheck.ok, false);
+    assert.equal(data.keyCheck.status, 400);
+    assert.match(data.keyCheck.error, /API key not valid/);
+    assert.ok(!text.includes('bad-key'), 'Health response must not contain the key');
   });
 
   for (const [label, overrides] of [
@@ -202,7 +220,9 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
         geminiKey: label !== 'key', passwords: label === 'passwords' ? 0 : 2, usageStore: label !== 'KV',
       });
       assert.equal(data.model, label === 'key' ? null : MODEL);
-      assert.equal(requests.length, 0);
+      // 키가 있으면 키 점검용 모델 목록 조회 1번 (모델은 고정이라 자동 선택 조회는 없음)
+      assert.equal(requests.length, label === 'key' ? 0 : 1);
+      assert.equal(data.keyCheck === null, label === 'key');
     });
   }
 
