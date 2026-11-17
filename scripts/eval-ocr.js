@@ -4,11 +4,16 @@
  *
  *   node scripts/eval-ocr.js --cases <cases.json> --img <사진 폴더> [--rounds 2] [--out <결과 폴더>]
  *                            [--models claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5]
+ *   node scripts/eval-ocr.js --cases <cases.json> --rescore <eval-….json>   정답만 고쳐 다시 채점 (AI 호출 없음)
+ *   cases 에 category(예: 손글씨·교재·실제 사진)가 있으면 종류별 표도 만든다
  *
  * cases.json: [{ id, desc, lines: [{ t: "문장", zh: false(중국어가 아니면) }], partial, equiv }]  →  사진은 <img>/<id>.jpg
  *   partial: true  실제 사진처럼 가려지거나 안 읽히는 글자가 있을 때. 정답(확실히 읽히는 글자) 중 몇 개를
- *                  순서대로 찾았는지(인식률)로 채점하고, 정답 밖에서 더 읽은 글자는 따로 셈 (틀렸다고 보지 않음)
+ *                  찾았는지(인식률)로 채점하고, 정답 밖에서 더 읽은 글자는 따로 셈 (틀렸다고 보지 않음).
+ *                  메뉴판·세로쓰기처럼 읽는 순서가 여러 가지일 수 있어 순서는 보지 않고 글자 개수로 맞춤
  *   equiv: { "级": "級" }  같은 글자로 인정할 이체자·간번체
+ *   fold: true     정답·인식 결과를 모두 간체로 바꿔 비교 (손글씨처럼 번체·간체·이체자 구분이 무의미할 때).
+ *                  변환표는 앱의 CC-CEDICT 데이터(docs/data/cedict.json)에서 만든다
  * 비밀번호는 OCR_PASSWORD 환경 변수 또는 실행 중 입력(화면에 안 보임). 파일·결과에는 남기지 않는다.
  * 중계 서버의 POST /eval 을 쓰므로 wrangler.toml 의 EVAL_DAILY_LIMIT 이 켜져 있어야 한다.
  */
@@ -83,6 +88,28 @@ function confusions(truth, pred) {
   return out;
 }
 
+/** 순서와 상관없이 맞힌 글자 수 (글자별 개수의 교집합) */
+function countChars(str) {
+  const m = new Map();
+  for (const ch of str) m.set(ch, (m.get(ch) || 0) + 1);
+  return m;
+}
+function bagHits(truth, pred) {
+  const p = countChars(pred);
+  let hit = 0;
+  for (const [ch, n] of countChars(truth)) hit += Math.min(n, p.get(ch) || 0);
+  return hit;
+}
+function bagMissed(truth, pred) {
+  const p = countChars(pred);
+  const miss = [];
+  for (const ch of truth) {
+    if (p.get(ch)) p.set(ch, p.get(ch) - 1);
+    else miss.push(ch);
+  }
+  return miss;
+}
+
 /** 정답 중 못 찾은 글자 (순서 맞춤 기준) */
 function missedChars(truth, pred) {
   const t = [...truth];
@@ -100,6 +127,77 @@ function missedChars(truth, pred) {
   }
   return miss;
 }
+
+/** 번체→간체 글자 변환표 (CC-CEDICT 의 번체·간체 짝에서 가장 흔한 대응) */
+let T2S = null;
+function t2s(str) {
+  if (!T2S) {
+    const counts = new Map();
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'docs', 'data', 'cedict.json'), 'utf8'));
+    for (const [simp, trad] of raw) {
+      if (!trad) continue;
+      const a = [...simp];
+      const b = [...trad];
+      if (a.length !== b.length) continue;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] === b[i]) continue;
+        const m = counts.get(b[i]) || new Map();
+        m.set(a[i], (m.get(a[i]) || 0) + 1);
+        counts.set(b[i], m);
+      }
+    }
+    T2S = new Map([...counts].map(([t, m]) => [t, [...m].sort((x, y) => y[1] - x[1])[0][0]]));
+  }
+  return [...str].map((ch) => T2S.get(ch) || ch).join('');
+}
+
+/** 서버 응답 하나를 채점해 결과 행으로 (--rescore 때는 저장된 행에서 응답을 되살려 다시 채점) */
+function scoreRow(c, model, r, round) {
+  const row = { round, id: c.id, desc: c.desc, category: c.category || null, model, ok: r.ok, attempt: r.attempt };
+  if (!r.ok) return Object.assign(row, { status: r.status, error: r.error });
+  const fold = (str) => (c.fold ? t2s(str) : str);
+  const eq = (str) => fold([...str].map((ch) => (c.equiv && c.equiv[ch]) || ch).join(''));
+  const tH = fold(hanOnly(c.truth));
+  const pH = eq(hanOnly(r.text || ''));
+  const hit = c.partial ? bagHits(tH, pH) : lcs(tH, pH);
+  const tP = hanPunct(c.truth);
+  const pP = hanPunct(r.text || '');
+  return Object.assign(row, {
+    served: r.model,
+    fallback: !!r.fallback,
+    ms: r.ms,
+    wall: r.wall,
+    tokensIn: r.tokens.input,
+    tokensOut: r.tokens.output,
+    cost: (r.tokens.input * PRICE[model].in + r.tokens.output * PRICE[model].out) / 1e6,
+    truthChars: [...tH].length,
+    hanErrors: c.partial ? [...tH].length - hit : lev(tH, pH),
+    partial: !!c.partial,
+    found: hit,
+    extra: [...pH].length - hit,
+    punctErrors: lev(tP, pP) - lev(tH, pH),
+    exact: c.partial ? hit === [...tH].length : tH === pH,
+    exactWithPunct: tP === pP,
+    foreignChars: foreign(r.text || ''),
+    confusions: c.partial ? [] : confusions(tH, pH),
+    missed: c.partial ? bagMissed(tH, pH) : [],
+    text: r.text,
+  });
+}
+
+/** 저장된 결과 행 → 서버 응답 모양 */
+const rowToResponse = (row) => ({
+  ok: row.ok,
+  attempt: row.attempt,
+  status: row.status,
+  error: row.error,
+  text: row.text,
+  model: row.served,
+  fallback: row.fallback,
+  ms: row.ms,
+  wall: row.wall,
+  tokens: { input: row.tokensIn, output: row.tokensOut },
+});
 
 /* ---------- 비밀번호 입력 (화면에 표시 안 함) ---------- */
 function askHidden(prompt) {
@@ -170,25 +268,36 @@ const pct = (x) => `${(x * 100).toFixed(1)}%`;
 async function main() {
   const casesPath = arg('cases');
   const imgDir = arg('img');
-  if (!casesPath || !imgDir) {
+  const rescore = arg('rescore');
+  if (!casesPath || (!imgDir && !rescore)) {
     console.error('사용법: node scripts/eval-ocr.js --cases <cases.json> --img <사진 폴더> [--rounds 2] [--out <폴더>]');
     process.exit(2);
   }
-  const rounds = Number(arg('rounds', '2')) || 1;
-  const models = arg('models', Object.keys(PRICE).join(',')).split(',').map((s) => s.trim()).filter(Boolean);
+  let rounds = Number(arg('rounds', '2')) || 1;
+  let models = arg('models', Object.keys(PRICE).join(',')).split(',').map((s) => s.trim()).filter(Boolean);
   const outDir = arg('out', path.dirname(path.resolve(casesPath)));
   const cases = JSON.parse(fs.readFileSync(casesPath, 'utf8')).map((c) => ({
     ...c,
     truth: c.lines.filter((l) => l.zh !== false).map((l) => l.t).join('\n'),
-    base64: fs.readFileSync(path.join(imgDir, `${c.id}.jpg`)).toString('base64'),
+    base64: rescore ? null : fs.readFileSync(path.join(imgDir, `${c.id}.jpg`)).toString('base64'),
   }));
 
-  const password = process.env.OCR_PASSWORD || (await askHidden('AI 비밀번호: '));
-  if (!password) throw new Error('비밀번호가 비어 있어요');
-
-  console.log(`\n${cases.length}장 × ${models.length}모델 × ${rounds}회 = ${cases.length * models.length * rounds}번 요청\n`);
   const results = [];
-  for (let round = 1; round <= rounds; round++) {
+  if (rescore) {
+    // 정답만 고쳐 다시 채점 — AI 를 다시 부르지 않음
+    const old = JSON.parse(fs.readFileSync(rescore, 'utf8'));
+    rounds = old.rounds;
+    models = old.models;
+    for (const row of old.results) {
+      const c = cases.find((x) => x.id === row.id);
+      if (c) results.push(scoreRow(c, row.model, rowToResponse(row), row.round));
+    }
+  }
+  const password = rescore ? null : process.env.OCR_PASSWORD || (await askHidden('AI 비밀번호: '));
+  if (!rescore && !password) throw new Error('비밀번호가 비어 있어요');
+
+  if (!rescore) console.log(`\n${cases.length}장 × ${models.length}모델 × ${rounds}회 = ${cases.length * models.length * rounds}번 요청\n`);
+  for (let round = 1; !rescore && round <= rounds; round++) {
     for (const c of cases) {
       // 같은 사진을 세 모델에 동시에 보냄 (시간은 서버가 각 호출마다 따로 잼)
       const runs = await Promise.all(models.map((m) => callEval(m, c.base64, password)));
@@ -199,38 +308,7 @@ async function main() {
           console.error(`\n중단: ${model} — ${r.error} (${r.code || r.status})`);
           process.exit(1);
         }
-        const row = { round, id: c.id, desc: c.desc, model, ok: r.ok, attempt: r.attempt };
-        if (r.ok) {
-          const eq = (str) => [...str].map((ch) => (c.equiv && c.equiv[ch]) || ch).join('');
-          const tH = hanOnly(c.truth);
-          const pH = eq(hanOnly(r.text || ''));
-          const hit = lcs(tH, pH);
-          const tP = hanPunct(c.truth);
-          const pP = hanPunct(r.text || '');
-          Object.assign(row, {
-            served: r.model,
-            fallback: !!r.fallback,
-            ms: r.ms,
-            wall: r.wall,
-            tokensIn: r.tokens.input,
-            tokensOut: r.tokens.output,
-            cost: (r.tokens.input * PRICE[model].in + r.tokens.output * PRICE[model].out) / 1e6,
-            truthChars: [...tH].length,
-            hanErrors: c.partial ? [...tH].length - hit : lev(tH, pH),
-            partial: !!c.partial,
-            found: hit,
-            extra: [...pH].length - hit,
-            punctErrors: lev(tP, pP) - lev(tH, pH),
-            exact: c.partial ? hit === [...tH].length : tH === pH,
-            exactWithPunct: tP === pP,
-            foreignChars: foreign(r.text || ''),
-            confusions: c.partial ? [] : confusions(tH, pH),
-            missed: c.partial ? missedChars(tH, pH) : [],
-            text: r.text,
-          });
-        } else {
-          Object.assign(row, { status: r.status, error: r.error });
-        }
+        const row = scoreRow(c, model, r, round);
         results.push(row);
         const mark = !r.ok ? `실패 ${r.error}` : `${(row.ms / 1000).toFixed(1)}s 오류 ${row.hanErrors}/${row.truthChars}${row.foreignChars ? ` 외국글자 ${row.foreignChars}` : ''}`;
         console.log(`[${round}] ${c.id.padEnd(15)} ${model.padEnd(18)} ${mark}`);
@@ -274,6 +352,22 @@ async function main() {
       `| ${s.model} | ${s.cer == null ? '-' : pct(s.cer)} | ${s.extra}자 | ${s.exactPages}/${s.requests - s.failures} | ${s.exactWithPunct}/${s.requests - s.failures} | ${s.foreignChars}자 | ${s.medianSec.toFixed(1)}초 | ${s.maxSec.toFixed(1)}초 | ${s.avgTokensIn}/${s.avgTokensOut} | $${s.costPerPhoto.toFixed(5)} | $${(s.costPerPhoto * 1000).toFixed(2)} | ${s.failures} |`,
     );
   }
+  const cats = [...new Set(cases.map((c) => c.category).filter(Boolean))];
+  if (cats.length) {
+    lines.push('');
+    lines.push('## 종류별 한자 오류율 (놓침 포함) · 한 글자도 안 틀린 횟수');
+    lines.push('');
+    lines.push(`| 종류 | ${models.join(' | ')} |`);
+    lines.push(`|---|${models.map(() => '---').join('|')}|`);
+    for (const cat of cats) {
+      const cells = models.map((m) => {
+        const ok = results.filter((r) => r.ok && r.model === m && r.category === cat);
+        const chars = sum(ok.map((r) => r.truthChars));
+        return chars ? `${pct(sum(ok.map((r) => r.hanErrors)) / chars)} · ${ok.filter((r) => r.exact).length}/${ok.length}` : '-';
+      });
+      lines.push(`| ${cat} | ${cells.join(' | ')} |`);
+    }
+  }
   lines.push('');
   lines.push('## 사진별 결과 (회차별)');
   lines.push('');
@@ -307,8 +401,9 @@ async function main() {
 
   fs.mkdirSync(outDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const mdPath = path.join(outDir, `eval-${stamp}.md`);
-  const jsonPath = path.join(outDir, `eval-${stamp}.json`);
+  const tag = rescore ? 'rescore' : 'eval';
+  const mdPath = path.join(outDir, `${tag}-${stamp}.md`);
+  const jsonPath = path.join(outDir, `${tag}-${stamp}.json`);
   fs.writeFileSync(mdPath, lines.join('\n') + '\n');
   fs.writeFileSync(jsonPath, JSON.stringify({ relay: RELAY, rounds, models, summary, results }, null, 2));
   console.log('\n' + lines.slice(0, 4 + summary.length + 2).join('\n'));
