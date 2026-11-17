@@ -130,6 +130,18 @@ async function countUse(env, user, usage) {
   };
 }
 
+async function refundUse(env, user, usage) {
+  const d = today();
+  const opts = { expirationTtl: 3 * 24 * 3600 };
+  const total = Math.max(0, usage.total.used - 1);
+  const mine = Math.max(0, usage.user.used - 1);
+  await Promise.all([
+    env.OCR_USAGE.put(`${d}:all`, String(total), opts),
+    env.OCR_USAGE.put(`${d}:u:${user}`, String(mine), opts),
+  ]);
+  return { total: { ...usage.total, used: total }, user: { ...usage.user, used: mine } };
+}
+
 /* ---------------- Gemini ---------------- */
 class UpstreamError extends Error {
   constructor(status, message) {
@@ -165,15 +177,27 @@ async function resolveModel(env) {
   return FALLBACK_MODELS[0];
 }
 
-/** 시도할 모델 순서 (최대 4개): 고른 모델 → 다른 Flash 계열 → 기본 별칭 */
+/**
+ * 시도할 모델 순서 (최대 4개): 최근 성공 → 가장 새 Flash → 가장 새 Flash-Lite(보통 덜 붐빔) → 그다음 Flash → 기본 별칭
+ * 같은 세대만 연달아 시도하면 한꺼번에 붐빌 때 다 실패하므로 Lite 를 섞음
+ */
 async function candidateModels(env) {
   const first = await resolveModel(env);
-  const others = env.GEMINI_MODEL ? [] : rankedModels.filter((n) => /flash/i.test(n));
-  return [...new Set([first, ...others, ...FALLBACK_MODELS])].slice(0, 4);
+  if (env.GEMINI_MODEL) return [...new Set([first, ...FALLBACK_MODELS])].slice(0, 4);
+  const flash = rankedModels.filter((n) => /flash/i.test(n) && !/lite/i.test(n));
+  const lite = rankedModels.filter((n) => /flash/i.test(n) && /lite/i.test(n));
+  return [...new Set([cachedModel, first, lite[0], flash[1], ...FALLBACK_MODELS].filter(Boolean))].slice(0, 4);
 }
+
+/** 응답이 늦거나 붐빔(과부하·일시 오류)으로 볼 상태 */
+const BUSY = new Set([500, 502, 503, 504, 524]);
 
 async function callGemini(env, base64) {
   const models = await candidateModels(env);
+  const started = Date.now();
+  const attemptMs = num(env.ATTEMPT_TIMEOUT_MS, 25000); // 모델 하나를 기다리는 최대 시간
+  const budgetMs = num(env.TOTAL_BUDGET_MS, 55000); // 전체 최대 대기 (사용자가 1분 넘게 기다리지 않게)
+  const minLeft = Math.min(8000, attemptMs / 3);
   // 큰 base64 문자열을 다시 JSON 으로 만들지 않고 이어 붙임 (무료 플랜 CPU 시간 절약)
   const body =
     '{"contents":[{"parts":[{"text":' +
@@ -183,20 +207,41 @@ async function callGemini(env, base64) {
     '"}}]}],"generationConfig":{"temperature":0,"maxOutputTokens":2048}}';
   let lastErr = null;
   let quotaErr = null;
+  let allBusy = true;
   for (const model of models) {
-    const res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
-      body,
-    });
-    const data = await res.json().catch(() => ({}));
+    const left = budgetMs - (Date.now() - started);
+    if (left < minLeft) break; // 남은 시간이 부족하면 더 시도하지 않음
+    const t0 = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.min(attemptMs, left));
+    let res;
+    let data;
+    try {
+      res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+        body,
+        signal: ctrl.signal,
+      });
+      data = await res.json().catch(() => ({}));
+    } catch (err) {
+      // 시간 초과(또는 연결 실패) → 다음 모델로
+      const timedOut = ctrl.signal.aborted;
+      console.log(JSON.stringify({ event: 'gemini', model, status: timedOut ? 'timeout' : 'network', ms: Date.now() - t0 }));
+      lastErr = new UpstreamError(504, timedOut ? `${model} 응답 시간 초과` : `${model} 연결 실패`);
+      if (cachedModel === model) cachedModel = null;
+      continue;
+    } finally {
+      clearTimeout(timer);
+    }
     // 진단용 로그 (npx wrangler tail 로 보임) — 사진·키·비밀번호는 남기지 않음
-    console.log(JSON.stringify({ event: 'gemini', model, status: res.status }));
+    console.log(JSON.stringify({ event: 'gemini', model, status: res.status, ms: Date.now() - t0 }));
     if (!res.ok) {
-      // 모델이 없어졌거나(404) 무료 범위가 아니거나(403·429) 일시 오류면 다음 모델로
+      // 모델이 없어졌거나(404) 무료 범위가 아니거나(403·429) 붐비면(503 등) 다음 모델로
       const msg = res.status === 404 ? `모델 ${model} 을(를) 찾을 수 없어요` : (data.error && data.error.message) || `HTTP ${res.status}`;
       lastErr = new UpstreamError(res.status, msg);
       if (res.status === 429) quotaErr = lastErr;
+      if (!BUSY.has(res.status)) allBusy = false;
       if (cachedModel === model) cachedModel = null;
       continue;
     }
@@ -212,8 +257,10 @@ async function callGemini(env, base64) {
     cachedModel = model; // 다음부터는 성공한 모델을 먼저 씀
     return { text, model, finishReason: cand.finishReason || null };
   }
-  // 한도 초과가 한 번이라도 있었으면 그것을 알림 (가장 흔한 원인)
-  throw quotaErr || lastErr || new UpstreamError(502, 'Gemini 를 호출하지 못했어요');
+  // 한도 초과가 한 번이라도 있었으면 그것을, 모두 느리거나 붐볐으면 '바쁨'을 알림
+  if (quotaErr) throw quotaErr;
+  if (lastErr && allBusy) throw new UpstreamError(503, lastErr.message);
+  throw lastErr || new UpstreamError(503, 'Gemini 가 제시간에 응답하지 않았어요');
 }
 
 /* ---------------- 요청 처리 ---------------- */
@@ -291,10 +338,23 @@ async function handle(request, env, cors) {
       const r = await callGemini(env, base64);
       return json({ text: r.text, model: r.model, finishReason: r.finishReason, usage }, 200, cors);
     } catch (err) {
-      if (err instanceof UpstreamError && err.status === 429) {
+      // Gemini 쪽 실패는 횟수에서 빼 줌 (사용자 잘못이 아니므로)
+      usage = await refundUse(env, user, usage).catch(() => usage);
+      const status = err instanceof UpstreamError ? err.status : 0;
+      if (status === 429) {
         return json({ error: 'Gemini 무료 한도를 다 썼어요. 잠시 뒤나 내일 다시 써 주세요.', code: 'gemini_quota', usage }, 429, cors);
       }
-      const status = err instanceof UpstreamError ? err.status : 0;
+      if (status === 503 || status === 504) {
+        return json(
+          {
+            error: "Gemini 서버가 지금 바빠요(응답 지연·과부하). 잠시 뒤 다시 해 보거나 기본 '인식하기'를 써 주세요.",
+            code: 'gemini_busy',
+            usage,
+          },
+          503,
+          cors,
+        );
+      }
       return json({ error: `Gemini 오류: ${err.message}`, code: 'upstream', upstreamStatus: status, usage }, 502, cors);
     }
   }

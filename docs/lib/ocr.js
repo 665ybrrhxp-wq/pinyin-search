@@ -255,7 +255,10 @@ async function relay(path, opts = {}) {
   let res;
   try {
     res = await fetch(relayUrl() + path, { ...opts, credentials: 'omit' });
-  } catch {
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw Object.assign(new Error("AI 응답이 너무 늦어요. 잠시 뒤 다시 하거나 기본 '인식하기'를 써 주세요."), { code: 'timeout' });
+    }
     throw Object.assign(new Error('AI 서버에 연결하지 못했어요 (인터넷 연결 확인)'), { code: 'network' });
   }
   const data = await res.json().catch(() => ({}));
@@ -294,17 +297,29 @@ async function aiRecognize(passFromForm) {
   st.busy = true;
   const buttons = ['#ocr-go', '#ocr-ai', '#ocr-ai-ok'].map((s) => $(s)).filter(Boolean);
   buttons.forEach((b) => (b.disabled = true));
+  const t0 = performance.now();
+  const secs = () => Math.round((performance.now() - t0) / 1000);
   setStatus('<span class="loading">AI가 읽는 중… (보통 몇 초)</span>');
+  // 몇 초째 기다리는지 보여 주고, 75초가 넘으면 포기 (중계 서버는 55초 안에 답을 줌)
+  const tick = setInterval(() => setStatus(`<span class="loading">AI가 읽는 중… ${secs()}초</span>`), 1000);
+  const ctrl = new AbortController();
+  const giveUp = setTimeout(() => ctrl.abort(), 75000);
   try {
     const canvas = regionCanvas(AI_MAX_SIDE);
     const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
     const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-    const t0 = performance.now();
-    const data = await relay('/ocr', {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain', 'X-Access-Password': pass },
-      body: base64,
-    });
+    let data;
+    try {
+      data = await relay('/ocr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', 'X-Access-Password': pass },
+        body: base64,
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearInterval(tick);
+      clearTimeout(giveUp);
+    }
     // 성공한 비밀번호만 기억
     if (passFromForm) {
       if ($('#ocr-ai-remember') && $('#ocr-ai-remember').checked) savePass(passFromForm);
@@ -313,12 +328,12 @@ async function aiRecognize(passFromForm) {
     $('#ocr-ai-box').innerHTML = `<p class="legend ocr-ai-meta">✨ ${esc(data.model || 'Gemini')} · ${esc(usageText(data.usage))}
       · <button type="button" class="link-btn" id="ocr-ai-forget">비밀번호 지우기</button></p>`;
     const lines = cleanText(data.text);
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const took = ((performance.now() - t0) / 1000).toFixed(1);
     if (!lines.length) {
-      setStatus(`<span class="warn">AI도 한자를 찾지 못했어요 (${secs}초).</span>`);
+      setStatus(`<span class="warn">AI도 한자를 찾지 못했어요 (${took}초).</span>`);
       $('#ocr-result').innerHTML = '';
     } else {
-      setStatus(`<span>AI가 ${lines.length}줄을 읽었어요 (${secs}초) · 틀린 글자는 고친 뒤 검색하세요</span>`);
+      setStatus(`<span>AI가 ${lines.length}줄을 읽었어요 (${took}초) · 틀린 글자는 고친 뒤 검색하세요</span>`);
       showResult(lines);
     }
   } catch (err) {

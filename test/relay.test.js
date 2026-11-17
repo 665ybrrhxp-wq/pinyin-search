@@ -77,6 +77,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
         method: (init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase(),
         headers: new Headers(init.headers || (input instanceof Request ? input.headers : undefined)),
         body: init.body !== undefined ? init.body : input instanceof Request ? await input.text() : null,
+        signal: init.signal,
       };
       requests.push(request);
       // Never delegate to the original fetch, including on an unexpected URL.
@@ -320,15 +321,48 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.deepEqual(generatedModels(), ['gone-model', 'gemini-flash-latest']);
   });
 
-  for (const [upstreamStatus, status, code] of [[429, 429, 'gemini_quota'], [500, 502, 'upstream']]) {
+  for (const [upstreamStatus, status, code] of [[429, 429, 'gemini_quota'], [500, 503, 'gemini_busy'], [400, 502, 'upstream']]) {
     test(`Gemini HTTP ${upstreamStatus} maps to ${status} ${code}`, async () => {
       generate = () => jsonResponse({ error: { message: `Canned HTTP ${upstreamStatus}` } }, upstreamStatus);
       const data = await assertError(await ocr(env({ GEMINI_MODEL: MODEL })), status, code);
-      if (upstreamStatus === 500) assert.equal(data.upstreamStatus, 500);
+      if (upstreamStatus === 400) assert.equal(data.upstreamStatus, 400);
       // 한도·서버 오류도 다음 모델로 넘어가 보고, 모두 실패하면 그 오류를 알림 (최대 4개)
       assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest', 'gemini-flash-lite-latest']);
+      // Gemini 쪽 실패는 횟수에서 빼 줌
+      assert.equal(data.usage.user.used, 0);
+      assert.equal(data.usage.total.used, 0);
     });
   }
+
+  // 신호가 오면 끊기는, 응답 없는 요청
+  const hang = (request) =>
+    new Promise((_, reject) => {
+      request.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    });
+
+  test('a model that does not answer in time is skipped for the next one', async () => {
+    generate = (model, request) => (model === MODEL ? hang(request) : successResponse());
+    const started = Date.now();
+    const response = await ocr(env({ GEMINI_MODEL: MODEL, ATTEMPT_TIMEOUT_MS: '60', TOTAL_BUDGET_MS: '2000' }));
+    const data = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(data));
+    assert.equal(data.model, 'gemini-flash-latest');
+    assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest']);
+    assert.ok(Date.now() - started < 1500, 'gave up on the hanging model quickly');
+  });
+
+  test('when every model hangs, it stops at the total time budget and reports busy with a refund', async () => {
+    generate = (model, request) => hang(request);
+    const started = Date.now();
+    const data = await assertError(
+      await ocr(env({ GEMINI_MODEL: MODEL, ATTEMPT_TIMEOUT_MS: '80', TOTAL_BUDGET_MS: '150' })),
+      503,
+      'gemini_busy',
+    );
+    assert.ok(Date.now() - started < 1000, 'respects the total budget');
+    assert.ok(generatedModels().length < 3, 'does not try every model after the budget is spent');
+    assert.equal(data.usage.user.used, 0);
+  });
 
   test('a model outside the free tier (429) falls back to the next model that works', async () => {
     generate = (model) =>
