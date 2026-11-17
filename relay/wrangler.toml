@@ -11,7 +11,7 @@ ALLOWED_ORIGINS = "https://665ybrrhxp-wq.github.io,http://localhost:3939"
 # 하루(한국 날짜 기준) 사용 상한 — 모든 사람 합계 / 한 사람당
 DAILY_LIMIT_TOTAL = "100"
 DAILY_LIMIT_PER_USER = "20"
-# 비워 두면 키로 쓸 수 있는 최신 Flash 모델을 자동으로 고름 (예: "gemini-flash-latest" 로 고정 가능)
+# 비워 두면 src/index.js 의 MODEL_PLAN 순서(3.6-flash → 3.5-flash-lite → 3.8-flash → 3.1-flash-lite)로 시도. 하나로 고정하려면 모델 이름 입력
 GEMINI_MODEL = ""
 # 사진(base64) 최대 길이 — 앱은 1600px JPEG 로 줄여 보내므로 보통 1MB 미만
 MAX_IMAGE_BASE64 = "4000000"

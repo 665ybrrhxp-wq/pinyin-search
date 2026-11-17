@@ -4,7 +4,8 @@ const { after, afterEach, before, beforeEach, describe, test } = require('node:t
 const assert = require('node:assert/strict');
 
 const GEMINI_BASE = 'https://gemini.test';
-const MODEL = 'gemini-9.0-flash';
+const MODEL = 'gemini-9.0-flash'; // 고정 설정(GEMINI_MODEL)으로 쓰는 시험용 모델
+const PLAN = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
 const ORIGIN = 'https://665ybrrhxp-wq.github.io';
 const TRANSCRIPTION = '我每天早上七点起床';
 
@@ -166,20 +167,20 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
 
   // Run auto-selection before any successful OCR call can populate cachedModel.
   // All subsequent OCR tests pin GEMINI_MODEL to avoid order-dependent selection.
-  test('GET /health reports safe configuration and automatically selects non-lite Flash', async () => {
+  test('GET /health reports safe configuration and the first planned model', async () => {
     const settings = env({ GEMINI_MODEL: '' });
     const response = await worker.fetch(req('/health'), settings);
     const text = await response.text();
     assert.equal(response.status, 200);
     const data = JSON.parse(text);
     assert.deepEqual(data.configured, { geminiKey: true, passwords: 2, usageStore: true });
-    assert.equal(data.model, MODEL);
+    assert.equal(data.model, PLAN[0]);
     for (const secret of [settings.GEMINI_API_KEY, settings.ACCESS_PASSWORDS, 'pw-one', 'pw-two']) {
       assert.ok(!text.includes(secret), `Health response must not contain secret ${secret}`);
     }
-    // 키 점검(모델 목록 조회) 1번 + 모델 자동 선택 1번
+    // 키 점검(모델 목록 조회) 1번
     assert.deepEqual(data.keyCheck, { ok: true, models: 4 });
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, 1);
     for (const r of requests) {
       assert.equal(r.method, 'GET');
       assert.equal(new URL(r.url).pathname, '/v1beta/models');
@@ -309,16 +310,19 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     });
   }
 
-  test('a missing configured model falls back to gemini-flash-latest', async () => {
+  test('a missing configured model falls back to the first planned model', async () => {
     generate = (model) => model === 'gone-model'
       ? jsonResponse({ error: { message: 'Model not found' } }, 404)
       : successResponse();
     const response = await ocr(env({ GEMINI_MODEL: 'gone-model' }));
     const data = await response.json();
     assert.equal(response.status, 200, JSON.stringify(data));
-    assert.equal(data.model, 'gemini-flash-latest');
+    // 404 다음에는 최근 성공 모델(이전 시험에서 기억됨) 또는 계획의 첫 모델로 넘어감
+    assert.equal(generatedModels()[0], 'gone-model');
+    assert.equal(generatedModels().length, 2);
+    assert.equal(data.model, generatedModels()[1]);
+    assert.ok([MODEL, PLAN[0]].includes(data.model));
     assert.equal(data.text, TRANSCRIPTION);
-    assert.deepEqual(generatedModels(), ['gone-model', 'gemini-flash-latest']);
   });
 
   for (const [upstreamStatus, status, code] of [[429, 429, 'gemini_quota'], [500, 503, 'gemini_busy'], [400, 502, 'upstream']]) {
@@ -327,7 +331,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
       const data = await assertError(await ocr(env({ GEMINI_MODEL: MODEL })), status, code);
       if (upstreamStatus === 400) assert.equal(data.upstreamStatus, 400);
       // 한도·서버 오류도 다음 모델로 넘어가 보고, 모두 실패하면 그 오류를 알림 (최대 4개)
-      assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest', 'gemini-flash-lite-latest']);
+      assert.deepEqual(generatedModels(), [MODEL, PLAN[0], PLAN[1], PLAN[2]]);
       // Gemini 쪽 실패는 횟수에서 빼 줌
       assert.equal(data.usage.user.used, 0);
       assert.equal(data.usage.total.used, 0);
@@ -346,8 +350,8 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     const response = await ocr(env({ GEMINI_MODEL: MODEL, ATTEMPT_TIMEOUT_MS: '60', TOTAL_BUDGET_MS: '2000' }));
     const data = await response.json();
     assert.equal(response.status, 200, JSON.stringify(data));
-    assert.equal(data.model, 'gemini-flash-latest');
-    assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest']);
+    assert.equal(data.model, PLAN[0]);
+    assert.deepEqual(generatedModels(), [MODEL, PLAN[0]]);
     assert.ok(Date.now() - started < 1500, 'gave up on the hanging model quickly');
   });
 
@@ -370,9 +374,9 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     const response = await ocr(env({ GEMINI_MODEL: MODEL }));
     const data = await response.json();
     assert.equal(response.status, 200, JSON.stringify(data));
-    assert.equal(data.model, 'gemini-flash-latest');
+    assert.equal(data.model, PLAN[0]);
     assert.equal(data.text, TRANSCRIPTION);
-    assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest']);
+    assert.deepEqual(generatedModels(), [MODEL, PLAN[0]]);
   });
 
   test('a Gemini prompt safety block returns 502 and includes SAFETY', async () => {
@@ -389,5 +393,23 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.equal(data.user, 'user1');
     assert.equal(data.usage.user.used, 0);
     assert.equal(requests.length, 0);
+  });
+
+  test('each planned model gets its documented thinking level and no temperature', async () => {
+    generate = (model) => (model === PLAN[3] ? successResponse() : jsonResponse({ error: { message: 'busy' } }, 503));
+    const response = await ocr(env({ GEMINI_MODEL: '', DAILY_LIMIT_PER_USER: '10', DAILY_LIMIT_TOTAL: '10' }));
+    assert.equal(response.status, 200);
+    const sent = requests.filter((r) => r.method === 'POST');
+    const levelOf = (r) => (JSON.parse(r.body).generationConfig.thinkingConfig || {}).thinkingLevel;
+    assert.deepEqual(sent.map((r) => decodeURIComponent(new URL(r.url).pathname.split('/').pop().replace(':generateContent', ''))), PLAN);
+    assert.deepEqual(sent.map(levelOf), ['minimal', 'minimal', 'low', 'minimal']);
+    for (const r of sent) assert.ok(!/temperature/.test(r.body), 'temperature must not be sent to 3.x models');
+  });
+
+  test('an unknown pinned model is sent without a thinking setting', async () => {
+    const response = await ocr(env({ GEMINI_MODEL: 'gemini-9.0-flash' }));
+    assert.equal(response.status, 200);
+    const body = JSON.parse(requests.find((r) => r.method === 'POST').body);
+    assert.equal(body.generationConfig.thinkingConfig, undefined);
   });
 });

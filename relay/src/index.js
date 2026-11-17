@@ -11,7 +11,8 @@
  *   GEMINI_API_KEY    Google AI Studio 에서 받은 키
  *   ACCESS_PASSWORDS  "이름:비밀번호,이름:비밀번호" (이름 없이 "비밀번호" 하나만 써도 됨)
  * 설정값 (wrangler.toml [vars])
- *   ALLOWED_ORIGINS, DAILY_LIMIT_TOTAL, DAILY_LIMIT_PER_USER, GEMINI_MODEL(비우면 자동 선택), MAX_IMAGE_BASE64
+ *   ALLOWED_ORIGINS, DAILY_LIMIT_TOTAL, DAILY_LIMIT_PER_USER, GEMINI_MODEL(비우면 MODEL_PLAN 순서), MAX_IMAGE_BASE64,
+ *   ATTEMPT_TIMEOUT_MS(모델당, 기본 25초), TOTAL_BUDGET_MS(전체, 기본 55초)
  * 저장소 (wrangler.toml [[kv_namespaces]])
  *   OCR_USAGE         하루 사용량 카운터 (3일 뒤 자동 삭제)
  *
@@ -22,7 +23,6 @@
  */
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
-const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
 const PROMPT =
   'Transcribe every Chinese character (simplified or traditional) visible in this image exactly as written, ' +
   'keeping the original line breaks and Chinese punctuation. Include handwriting. ' +
@@ -150,43 +150,36 @@ class UpstreamError extends Error {
   }
 }
 
-let rankedModels = []; // 키로 쓸 수 있는 모델을 선호 순서대로 (최신 Flash 먼저)
+/**
+ * 시도할 모델과 사고(thinking) 수준 — Google AI Studio 문서(2026-11) 기준, 무료·안정(Stable) 모델만.
+ *  - 3.x Flash 는 thinkingLevel 을 안 주면 'medium' 으로 오래 생각해서 느림 → 가장 낮게 지정
+ *  - 3.8-flash 는 'minimal' 을 지원하지 않아 'low'
+ *  - 3.7-flash·3.5-flash 는 폐기되어 3.8·3.6 으로 연결되므로 넣지 않음 (같은 모델을 두 번 부르게 됨)
+ *  - 정확도를 위해 일반 Flash 를 먼저, 붐빌 때를 대비해 다른 계열(Lite)을 사이에 섞음
+ */
+const MODEL_PLAN = [
+  { model: 'gemini-3.6-flash', thinkingLevel: 'minimal' },
+  { model: 'gemini-3.5-flash-lite', thinkingLevel: 'minimal' },
+  { model: 'gemini-3.8-flash', thinkingLevel: 'low' },
+  { model: 'gemini-3.1-flash-lite', thinkingLevel: 'minimal' },
+];
 
-/** 사용할 모델: 설정값 → 이전에 성공한 것 → 목록에서 가장 새 Flash 계열 자동 선택 */
-async function resolveModel(env) {
-  if (env.GEMINI_MODEL) return env.GEMINI_MODEL;
-  if (cachedModel) return cachedModel;
-  try {
-    const res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models?pageSize=1000`, {
-      headers: { 'x-goog-api-key': env.GEMINI_API_KEY },
-    });
-    const data = await res.json();
-    const names = (data.models || [])
-      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
-      .map((m) => String(m.name || '').replace(/^models\//, ''))
-      .filter((n) => /gemini/i.test(n) && !/(tts|image|embedding|aqa|live|audio|computer|robotics|thinking|exp)/i.test(n));
-    const version = (n) => Number((/gemini-(\d+(?:\.\d+)?)/i.exec(n) || [])[1]) || 0;
-    const rank = (n) =>
-      (/flash/i.test(n) ? 1000 : 0) + (/lite/i.test(n) ? -300 : 0) + (/preview/i.test(n) ? -100 : 0) + version(n) * 10;
-    names.sort((a, b) => rank(b) - rank(a));
-    rankedModels = names;
-    if (names[0]) return names[0];
-  } catch {
-    /* 목록을 못 받으면 기본 별칭 사용 */
-  }
-  return FALLBACK_MODELS[0];
+function thinkingLevelFor(model) {
+  const plan = MODEL_PLAN.find((p) => p.model === model);
+  if (plan) return plan.thinkingLevel;
+  if (/lite/i.test(model)) return 'minimal';
+  if (/gemini-3\.8/i.test(model)) return 'low';
+  return null; // 모르는 모델은 기본값 그대로 (잘못된 값으로 400 이 나지 않게)
 }
 
-/**
- * 시도할 모델 순서 (최대 4개): 최근 성공 → 가장 새 Flash → 가장 새 Flash-Lite(보통 덜 붐빔) → 그다음 Flash → 기본 별칭
- * 같은 세대만 연달아 시도하면 한꺼번에 붐빌 때 다 실패하므로 Lite 를 섞음
- */
+/** 첫 번째로 쓸 모델 (/health 표시용) */
+async function resolveModel(env) {
+  return env.GEMINI_MODEL || cachedModel || MODEL_PLAN[0].model;
+}
+
+/** 시도할 모델 순서 (최대 4개): 고정 설정 → 최근 성공 → 계획 순서 */
 async function candidateModels(env) {
-  const first = await resolveModel(env);
-  if (env.GEMINI_MODEL) return [...new Set([first, ...FALLBACK_MODELS])].slice(0, 4);
-  const flash = rankedModels.filter((n) => /flash/i.test(n) && !/lite/i.test(n));
-  const lite = rankedModels.filter((n) => /flash/i.test(n) && /lite/i.test(n));
-  return [...new Set([cachedModel, first, lite[0], flash[1], ...FALLBACK_MODELS].filter(Boolean))].slice(0, 4);
+  return [...new Set([env.GEMINI_MODEL, cachedModel, ...MODEL_PLAN.map((p) => p.model)].filter(Boolean))].slice(0, 4);
 }
 
 /** 응답이 늦거나 붐빔(과부하·일시 오류)으로 볼 상태 */
@@ -199,12 +192,15 @@ async function callGemini(env, base64) {
   const budgetMs = num(env.TOTAL_BUDGET_MS, 55000); // 전체 최대 대기 (사용자가 1분 넘게 기다리지 않게)
   const minLeft = Math.min(8000, attemptMs / 3);
   // 큰 base64 문자열을 다시 JSON 으로 만들지 않고 이어 붙임 (무료 플랜 CPU 시간 절약)
-  const body =
-    '{"contents":[{"parts":[{"text":' +
-    JSON.stringify(PROMPT) +
-    '},{"inline_data":{"mime_type":"image/jpeg","data":"' +
-    base64 +
-    '"}}]}],"generationConfig":{"temperature":0,"maxOutputTokens":2048}}';
+  // temperature 는 3.x 에서 샘플링 설정이 제거되어 400 이 날 수 있어 보내지 않음
+  const head = '{"contents":[{"role":"user","parts":[{"text":' + JSON.stringify(PROMPT) + '},{"inline_data":{"mime_type":"image/jpeg","data":"';
+  const bodyFor = (model) => {
+    const level = thinkingLevelFor(model);
+    const gen = level
+      ? `{"thinkingConfig":{"thinkingLevel":"${level}"},"maxOutputTokens":4096}`
+      : '{"maxOutputTokens":4096}';
+    return head + base64 + '"}}]}],"generationConfig":' + gen + '}';
+  };
   let lastErr = null;
   let quotaErr = null;
   let allBusy = true;
@@ -220,7 +216,7 @@ async function callGemini(env, base64) {
       res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
-        body,
+        body: bodyFor(model),
         signal: ctrl.signal,
       });
       data = await res.json().catch(() => ({}));
