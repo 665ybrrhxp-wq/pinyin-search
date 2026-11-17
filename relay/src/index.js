@@ -12,7 +12,7 @@
  *   GEMINI_API_KEY    Google AI Studio 에서 받은 키 (Claude 가 바쁘거나 실패할 때 예비)
  *   ACCESS_PASSWORDS  "이름:비밀번호,이름:비밀번호" (이름 없이 "비밀번호" 하나만 써도 됨)
  * 설정값 (wrangler.toml [vars])
- *   AI_PROVIDERS(시도 순서, 기본 "claude,gemini"), CLAUDE_MODEL(기본 claude-opus-5-5), CLAUDE_EFFORT(기본 low),
+ *   AI_PROVIDERS(시도 순서, 기본 "claude,gemini"), CLAUDE_MODEL(기본 claude-sonnet-5-5), CLAUDE_EFFORT(기본 low),
  *   CLAUDE_TIMEOUT_MS(기본 45초), ALLOWED_ORIGINS, DAILY_LIMIT_TOTAL, DAILY_LIMIT_PER_USER,
  *   GEMINI_MODEL(비우면 MODEL_PLAN 순서), MAX_IMAGE_BASE64, ATTEMPT_TIMEOUT_MS(Gemini 모델당 25초), TOTAL_BUDGET_MS(전체 55초)
  * 저장소 (wrangler.toml [[kv_namespaces]])
@@ -22,6 +22,8 @@
  *   GET  /health   설정 상태·사용 모델 확인 (비밀번호 불필요, 비밀값은 내보내지 않음)
  *   GET  /usage    비밀번호 확인 + 오늘 남은 횟수
  *   POST /ocr      본문 = JPEG 의 base64 문자열(text/plain), 헤더 X-Access-Password
+ *   POST /eval?model=…  모델 비교 평가용 (EVAL_DAILY_LIMIT 를 켰을 때만). 허용된 Claude 모델 하나로만 읽고
+ *                  걸린 시간·토큰 수를 돌려줌. 예비 공급자로 넘기지 않으며, 일반 사용 횟수와 따로 셈
  */
 import Anthropic, {
   APIConnectionError,
@@ -34,7 +36,9 @@ import Anthropic, {
 } from '@anthropic-ai/sdk';
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
-const CLAUDE_DEFAULT_MODEL = 'claude-opus-5-5';
+const CLAUDE_DEFAULT_MODEL = 'claude-sonnet-5-5';
+/** /eval 에서 비교할 수 있는 모델 (이 밖의 이름은 거절) */
+const EVAL_MODELS = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
 const PROMPT =
   'Transcribe every Chinese character (simplified or traditional) visible in this image exactly as written, ' +
   'keeping the original line breaks and Chinese punctuation. Include handwriting. ' +
@@ -283,16 +287,17 @@ function claudeClient(env, timeoutMs) {
   });
 }
 
-async function callClaude(env, base64, timeoutMs) {
-  const model = env.CLAUDE_MODEL || CLAUDE_DEFAULT_MODEL;
+async function callClaude(env, base64, timeoutMs, modelOverride) {
+  const model = modelOverride || env.CLAUDE_MODEL || CLAUDE_DEFAULT_MODEL;
   const t0 = Date.now();
   try {
+    // 안전 분류기가 거절하면 같은 요청을 서버에서 다른 모델로 이어서 처리 (Anthropic 권장 기본값)
+    // Haiku 는 서버 측 fallback 을 지원하지 않아 뺌
+    const fallback = /haiku/i.test(model) ? {} : { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' };
     const response = await claudeClient(env, timeoutMs).beta.messages.create({
       model,
       max_tokens: 16000,
-      // 안전 분류기가 거절하면 같은 요청을 서버에서 다른 모델로 이어서 처리 (Anthropic 권장 기본값)
-      betas: ['server-side-fallback-2026-07-01'],
-      fallbacks: 'default',
+      ...fallback,
       // 글자 옮겨 적기는 단순한 일이라 낮은 effort 로 빠르고 저렴하게
       output_config: { effort: env.CLAUDE_EFFORT || 'low' },
       messages: [
@@ -316,7 +321,15 @@ async function callClaude(env, base64, timeoutMs) {
       .map((b) => b.text)
       .join('')
       .trim();
-    return { text, model: response.model, finishReason: response.stop_reason };
+    const servedByFallback = (u.iterations || []).some((it) => it && it.type === 'fallback_message');
+    return {
+      text,
+      model: response.model,
+      finishReason: response.stop_reason,
+      ms: Date.now() - t0,
+      tokens: { input: u.input_tokens || 0, output: u.output_tokens || 0 },
+      fallback: servedByFallback,
+    };
   } catch (err) {
     if (err instanceof UpstreamError) throw err;
     const timedOut = err instanceof APIConnectionTimeoutError;
@@ -476,6 +489,33 @@ async function handle(request, env, cors) {
         );
       }
       return json({ error: `AI 오류: ${err.message}`, code: 'upstream', upstreamStatus: status, usage }, 502, cors);
+    }
+  }
+
+  if (url.pathname === '/eval' && request.method === 'POST') {
+    const limit = Number(env.EVAL_DAILY_LIMIT) || 0;
+    if (!limit || !env.ANTHROPIC_API_KEY) return json({ error: '평가 기능이 꺼져 있어요', code: 'eval_off' }, 404, cors);
+    const user = await authenticate(request, env);
+    if (!user) {
+      await sleep(600);
+      return json({ error: '비밀번호가 맞지 않아요', code: 'auth' }, 401, cors);
+    }
+    const model = url.searchParams.get('model') || '';
+    if (!EVAL_MODELS.includes(model)) return json({ error: '평가할 수 없는 모델이에요', code: 'bad_model', models: EVAL_MODELS }, 400, cors);
+    const base64 = (await request.text()).trim();
+    if (!base64 || base64.length > num(env.MAX_IMAGE_BASE64, 4000000) || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
+      return json({ error: '사진 형식이 올바르지 않아요', code: 'bad_image' }, 400, cors);
+    }
+    const key = `${today()}:eval:${user}`;
+    const used = Number(await env.OCR_USAGE.get(key)) || 0;
+    if (used >= limit) return json({ error: `오늘 평가 횟수(${limit}회)를 다 썼어요`, code: 'limit_eval', used, limit }, 429, cors);
+    await env.OCR_USAGE.put(key, String(used + 1), { expirationTtl: 3 * 24 * 3600 });
+    try {
+      const r = await callClaude(env, base64, num(env.EVAL_TIMEOUT_MS, 90000), model);
+      return json({ requested: model, ...r, eval: { used: used + 1, limit } }, 200, cors);
+    } catch (err) {
+      const status = err instanceof UpstreamError ? err.status : 0;
+      return json({ requested: model, error: err.message, code: 'upstream', upstreamStatus: status, eval: { used: used + 1, limit } }, 502, cors);
     }
   }
 

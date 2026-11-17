@@ -11,8 +11,8 @@ AI API 키를 공개 사이트에 넣지 않고 여기(Cloudflare 비밀값)에�
 - **비밀번호**: 사람마다 따로 줄 수 있음 (`이름:비밀번호` 여러 개). 한 명만 막고 싶으면 그 항목만 지우면 됨.
 - **하루 상한**: 전체 `DAILY_LIMIT_TOTAL`(기본 100회), 한 사람 `DAILY_LIMIT_PER_USER`(기본 20회). 한국 날짜 기준으로 매일 초기화.
 - **사진은 저장하지 않음** (AI 로 전달만). 단 Gemini **무료** 키로 처리될 때는 Google 이 입력을 서비스 개선에 쓸 수 있음.
-- 비용: Cloudflare Workers 무료 플랜 + Claude API 크레딧(사진 1장 약 $0.02~0.03, Opus 5.5·effort low 추정 — 실제 토큰은 `npx wrangler tail` 로그의 in/out 으로 확인) + Gemini 무료 사용분.
-  하루 상한(전체 100회)이 있어 최대 하루 약 $3. Claude Console 에서 월 사용 한도(spend limit)도 걸어 두면 안전.
+- 비용: Cloudflare Workers 무료 플랜 + Claude API 크레딧(Sonnet 5.5·effort low, 작은 사진 실측 약 $0.0012~0.0015/장 — 큰 휴대폰 사진은 토큰이 더 늘 수 있음, 실제 토큰은 `npx wrangler tail` 로그의 in/out) + Gemini 무료 사용분.
+  하루 상한(전체 100회)이 있어 하루 비용은 많아야 몇십 센트 수준. Claude Console 에서 월 사용 한도(spend limit)도 걸어 두면 안전.
 
 ## 처음 설정 (한 번만)
 
@@ -58,9 +58,23 @@ npx wrangler deploy
 ```bash
 npx wrangler secret put ANTHROPIC_API_KEY
 ```
-물으면 키를 붙여넣기. 확인: `<주소>/health` 에 `"claude":{"model":"claude-opus-5-5","keyCheck":{"ok":true…}}`.
+물으면 키를 붙여넣기. 확인: `<주소>/health` 에 `"claude":{"model":"claude-sonnet-5-5","keyCheck":{"ok":true…}}`.
 
 모델·깊이는 `wrangler.toml` 의 `CLAUDE_MODEL`(opus-5-5 / sonnet-5-5 / haiku-5-5), `CLAUDE_EFFORT`(low/medium/high), 순서는 `AI_PROVIDERS`.
+
+### 모델 비교 결과 (2026-11-17, effort low) — 기본값 Sonnet 5.5 의 근거
+
+| | 합성 사진 10장×2회 | 실제 거리 간판 사진 3장×3회 (확실한 글자 인식) | 시간 중앙값 (실제 사진) | 사진 1장 비용 (실제 사진) |
+|---|---|---|---|---|
+| Opus 5.5 | 100% | 100% (9/9 무결) | 3.5초 | 약 $0.0048 |
+| **Sonnet 5.5** | 100% | 100% (9/9 무결) | **1.4초** | 약 $0.0012 |
+| Haiku 5.5 | 100% | 97% (5/9 무결, 特產禮→特座複 등, 회차마다 다름) | 2.9초 | 약 $0.0002 |
+
+쉬운 사진은 셋 다 같고, 어려운 사진에서 Haiku 가 틀림. Opus 는 Sonnet 보다 나은 점 없이 느리고 비쌈.
+한계: 실제 사진은 3장(작은 거리 간판)뿐이고 손글씨는 시험하지 않음.
+
+다시 비교하려면: `wrangler.toml` 의 `EVAL_DAILY_LIMIT` 를 `"100"` 으로 바꿔 deploy →
+`node scripts/eval-ocr.js --cases <cases.json> --img <사진 폴더> --rounds 2` (비밀번호는 실행 중 입력) → 끝나면 `"0"` 으로 되돌려 deploy.
 
 ## 바꾸고 싶을 때
 
@@ -70,6 +84,7 @@ npx wrangler secret put ANTHROPIC_API_KEY
 | 하루 상한 변경 | `wrangler.toml` 의 `DAILY_LIMIT_*` 수정 → `npx wrangler deploy` |
 | Gemini 모델 고정 | `GEMINI_MODEL = "gemini-…"` 입력 → deploy (비워 두면 `src/index.js` 의 `MODEL_PLAN` 순서) |
 | Claude 모델·깊이 | `CLAUDE_MODEL`, `CLAUDE_EFFORT` 수정 → deploy |
+| 모델 비교 평가 | 위 「모델 비교 결과」 참고 (`EVAL_DAILY_LIMIT`) |
 | 키 교체 | `npx wrangler secret put GEMINI_API_KEY` |
 | 실시간 로그 | `npx wrangler tail` |
 

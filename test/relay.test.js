@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 
 const GEMINI_BASE = 'https://gemini.test';
 const CLAUDE_BASE = 'https://claude.test';
-const CLAUDE_MODEL = 'claude-opus-5-5';
+const CLAUDE_MODEL = 'claude-sonnet-5-5';
 const MODEL = 'gemini-9.0-flash'; // 고정 설정(GEMINI_MODEL)으로 쓰는 시험용 모델
 const PLAN = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
 const ORIGIN = 'https://665ybrrhxp-wq.github.io';
@@ -143,7 +143,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
       }
       if (request.method === 'GET' && url.pathname === `/v1/models/${CLAUDE_MODEL}`) {
         return jsonResponse({
-          type: 'model', id: CLAUDE_MODEL, display_name: 'Claude Opus 5.5', created_at: '2026-01-01T00:00:00Z',
+          type: 'model', id: CLAUDE_MODEL, display_name: 'Claude Sonnet 5.5', created_at: '2026-01-01T00:00:00Z',
         });
       }
       unexpectedRequests.push(request);
@@ -482,8 +482,8 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.equal(upstream.headers.get('x-api-key'), null);
   });
 
-  test('Claude sends configured model and effort overrides', async () => {
-    const model = 'claude-sonnet-5-5';
+  test('Claude sends configured model and effort overrides (Haiku without server-side fallback)', async () => {
+    const model = 'claude-haiku-5-5';
     claude = () => claudeSuccessResponse({ model });
     const response = await ocr(claudeEnv({ CLAUDE_MODEL: model, CLAUDE_EFFORT: 'medium' }));
     const data = await response.json();
@@ -493,6 +493,9 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     const body = JSON.parse(claudeRequests()[0].body);
     assert.equal(body.model, model);
     assert.equal(body.output_config.effort, 'medium');
+    // Haiku 5.5 는 서버 측 fallback 이 없어 beta 헤더·fallbacks 를 보내지 않음
+    assert.equal(body.fallbacks, undefined);
+    assert.ok(!/server-side-fallback/.test(claudeRequests()[0].headers.get('anthropic-beta') || ''));
     assert.deepEqual(generatedModels(), []);
   });
 
@@ -574,7 +577,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.deepEqual(data.providers, ['claude', 'gemini']);
     assert.equal(data.claude.model, CLAUDE_MODEL);
     assert.equal(data.claude.keyCheck.ok, true);
-    assert.equal(data.claude.keyCheck.displayName, 'Claude Opus 5.5');
+    assert.equal(data.claude.keyCheck.displayName, 'Claude Sonnet 5.5');
     for (const secret of [settings.ANTHROPIC_API_KEY, settings.GEMINI_API_KEY, settings.ACCESS_PASSWORDS, 'pw-one', 'pw-two']) {
       assert.ok(!text.includes(secret), `Health response must not contain secret ${secret}`);
     }
@@ -623,5 +626,56 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.deepEqual(generatedModels(), []);
     assert.equal(data.usage.user.used, 0);
     assert.equal(data.usage.total.used, 0);
+  });
+
+  const evalReq = (settings, model, password = 'pw-one', body = 'QUJD') =>
+    worker.fetch(req(`/eval?model=${encodeURIComponent(model)}`, { method: 'POST', password, body }), settings);
+
+  test('POST /eval is off unless EVAL_DAILY_LIMIT is set', async () => {
+    await assertError(await evalReq(claudeEnv(), 'claude-opus-5-5'), 404, 'eval_off');
+    assert.equal(requests.length, 0);
+  });
+
+  test('POST /eval rejects a wrong password and an unlisted model', async () => {
+    const settings = claudeEnv({ EVAL_DAILY_LIMIT: '5' });
+    await assertError(await evalReq(settings, 'claude-opus-5-5', 'nope'), 401, 'auth');
+    await assertError(await evalReq(settings, 'claude-fable-5-2'), 400, 'bad_model');
+    assert.equal(requests.length, 0);
+  });
+
+  for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+    test(`POST /eval runs only ${model} and reports time and tokens`, async () => {
+      claude = () => claudeSuccessResponse({ model });
+      const settings = claudeEnv({ EVAL_DAILY_LIMIT: '5' });
+      const response = await evalReq(settings, model);
+      const data = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(data));
+      assert.equal(data.requested, model);
+      assert.equal(data.model, model);
+      assert.equal(data.text, TRANSCRIPTION);
+      assert.deepEqual(data.tokens, { input: 1200, output: 40 });
+      assert.equal(typeof data.ms, 'number');
+      assert.equal(data.fallback, false);
+      assert.deepEqual(data.eval, { used: 1, limit: 5 });
+      const body = JSON.parse(claudeRequests()[0].body);
+      assert.equal(body.model, model);
+      assert.equal(body.output_config.effort, 'low');
+      assert.equal(body.fallbacks, /haiku/.test(model) ? undefined : 'default');
+      assert.deepEqual(generatedModels(), [], 'eval must never use Gemini');
+      // 일반 사용 횟수는 건드리지 않음
+      assert.ok(!settings.OCR_USAGE.puts.some((p) => !p.key.includes(':eval:')));
+    });
+  }
+
+  test('POST /eval enforces its own daily limit and does not fall back on errors', async () => {
+    const settings = claudeEnv({ EVAL_DAILY_LIMIT: '2' });
+    claude = () => claudeErrorResponse(529, 'overloaded_error', 'Overloaded');
+    const failed = await assertError(await evalReq(settings, 'claude-opus-5-5'), 502, 'upstream');
+    assert.equal(failed.upstreamStatus, 503);
+    assert.deepEqual(generatedModels(), []);
+    claude = () => claudeSuccessResponse();
+    assert.equal((await evalReq(settings, 'claude-sonnet-5-5')).status, 200);
+    await assertError(await evalReq(settings, 'claude-sonnet-5-5'), 429, 'limit_eval');
+    assert.equal(claudeRequests().filter((r) => r.method === 'POST').length, 2);
   });
 });
