@@ -10,7 +10,7 @@
 
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 // AI 인식 중계 서버(relay/, Cloudflare Worker) 주소. 비어 있으면 'AI로 읽기' 버튼을 숨김.
-const AI_RELAY_URL = '';
+const AI_RELAY_URL = 'https://pinyin-ocr-relay.pinyin-ocr-relay.workers.dev';
 const AI_PASS_KEY = 'pinyin-search:ai-pass'; // 이 기기에만 저장되는 AI 사용 비밀번호
 const AI_MAX_SIDE = 1600; // AI 로 보낼 사진의 긴 변 (보통 1MB 미만)
 const relayUrl = () => String(window.PINYIN_AI_RELAY || AI_RELAY_URL || '').replace(/\/+$/, '');

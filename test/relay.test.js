@@ -325,9 +325,21 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
       generate = () => jsonResponse({ error: { message: `Canned HTTP ${upstreamStatus}` } }, upstreamStatus);
       const data = await assertError(await ocr(env({ GEMINI_MODEL: MODEL })), status, code);
       if (upstreamStatus === 500) assert.equal(data.upstreamStatus, 500);
-      assert.deepEqual(generatedModels(), [MODEL], 'Do not retry quota or server errors as model fallback');
+      // 한도·서버 오류도 다음 모델로 넘어가 보고, 모두 실패하면 그 오류를 알림 (최대 4개)
+      assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest', 'gemini-flash-lite-latest']);
     });
   }
+
+  test('a model outside the free tier (429) falls back to the next model that works', async () => {
+    generate = (model) =>
+      model === MODEL ? jsonResponse({ error: { message: 'Quota exceeded, limit: 0' } }, 429) : successResponse();
+    const response = await ocr(env({ GEMINI_MODEL: MODEL }));
+    const data = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(data));
+    assert.equal(data.model, 'gemini-flash-latest');
+    assert.equal(data.text, TRANSCRIPTION);
+    assert.deepEqual(generatedModels(), [MODEL, 'gemini-flash-latest']);
+  });
 
   test('a Gemini prompt safety block returns 502 and includes SAFETY', async () => {
     generate = () => jsonResponse({ promptFeedback: { blockReason: 'SAFETY' } });

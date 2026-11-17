@@ -138,7 +138,9 @@ class UpstreamError extends Error {
   }
 }
 
-/** 사용할 모델: 설정값 → 이전에 고른 것 → 목록에서 가장 새 Flash 계열 자동 선택 */
+let rankedModels = []; // 키로 쓸 수 있는 모델을 선호 순서대로 (최신 Flash 먼저)
+
+/** 사용할 모델: 설정값 → 이전에 성공한 것 → 목록에서 가장 새 Flash 계열 자동 선택 */
 async function resolveModel(env) {
   if (env.GEMINI_MODEL) return env.GEMINI_MODEL;
   if (cachedModel) return cachedModel;
@@ -155,16 +157,23 @@ async function resolveModel(env) {
     const rank = (n) =>
       (/flash/i.test(n) ? 1000 : 0) + (/lite/i.test(n) ? -300 : 0) + (/preview/i.test(n) ? -100 : 0) + version(n) * 10;
     names.sort((a, b) => rank(b) - rank(a));
-    if (names[0]) return (cachedModel = names[0]);
+    rankedModels = names;
+    if (names[0]) return names[0];
   } catch {
     /* 목록을 못 받으면 기본 별칭 사용 */
   }
   return FALLBACK_MODELS[0];
 }
 
-async function callGemini(env, base64) {
+/** 시도할 모델 순서 (최대 4개): 고른 모델 → 다른 Flash 계열 → 기본 별칭 */
+async function candidateModels(env) {
   const first = await resolveModel(env);
-  const models = [...new Set([first, ...FALLBACK_MODELS])];
+  const others = env.GEMINI_MODEL ? [] : rankedModels.filter((n) => /flash/i.test(n));
+  return [...new Set([first, ...others, ...FALLBACK_MODELS])].slice(0, 4);
+}
+
+async function callGemini(env, base64) {
+  const models = await candidateModels(env);
   // 큰 base64 문자열을 다시 JSON 으로 만들지 않고 이어 붙임 (무료 플랜 CPU 시간 절약)
   const body =
     '{"contents":[{"parts":[{"text":' +
@@ -173,6 +182,7 @@ async function callGemini(env, base64) {
     base64 +
     '"}}]}],"generationConfig":{"temperature":0,"maxOutputTokens":2048}}';
   let lastErr = null;
+  let quotaErr = null;
   for (const model of models) {
     const res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
@@ -180,12 +190,16 @@ async function callGemini(env, base64) {
       body,
     });
     const data = await res.json().catch(() => ({}));
-    if (res.status === 404) {
-      lastErr = new UpstreamError(404, `모델 ${model} 을(를) 찾을 수 없어요`);
+    // 진단용 로그 (npx wrangler tail 로 보임) — 사진·키·비밀번호는 남기지 않음
+    console.log(JSON.stringify({ event: 'gemini', model, status: res.status }));
+    if (!res.ok) {
+      // 모델이 없어졌거나(404) 무료 범위가 아니거나(403·429) 일시 오류면 다음 모델로
+      const msg = res.status === 404 ? `모델 ${model} 을(를) 찾을 수 없어요` : (data.error && data.error.message) || `HTTP ${res.status}`;
+      lastErr = new UpstreamError(res.status, msg);
+      if (res.status === 429) quotaErr = lastErr;
       if (cachedModel === model) cachedModel = null;
-      continue; // 모델 이름이 바뀌었으면 다음 후보로
+      continue;
     }
-    if (!res.ok) throw new UpstreamError(res.status, (data.error && data.error.message) || `HTTP ${res.status}`);
     const cand = (data.candidates || [])[0];
     if (!cand) {
       const reason = data.promptFeedback && data.promptFeedback.blockReason;
@@ -195,10 +209,11 @@ async function callGemini(env, base64) {
       .map((p) => p.text || '')
       .join('')
       .trim();
-    cachedModel = model;
+    cachedModel = model; // 다음부터는 성공한 모델을 먼저 씀
     return { text, model, finishReason: cand.finishReason || null };
   }
-  throw lastErr || new UpstreamError(502, 'Gemini 를 호출하지 못했어요');
+  // 한도 초과가 한 번이라도 있었으면 그것을 알림 (가장 흔한 원인)
+  throw quotaErr || lastErr || new UpstreamError(502, 'Gemini 를 호출하지 못했어요');
 }
 
 /* ---------------- 요청 처리 ---------------- */
