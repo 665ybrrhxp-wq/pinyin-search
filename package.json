@@ -9,7 +9,7 @@
     "serve": "node server.js",
     "build-data": "node scripts/build-data.js",
     "rebuild-data": "node scripts/build-data.js --force",
-    "test": "node --test test/"
+    "test": "node --test \"test/**/*.js\""
   },
   "engines": {
     "node": ">=18"
