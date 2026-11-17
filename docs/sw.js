@@ -8,7 +8,7 @@
  * 캐시는 'pinyin-search-' 로 시작하는 이름만 만들고 지운다. 다른 이름의 캐시는 절대 건드리지 않는다.
  */
 const PREFIX = 'pinyin-search-';
-const SHELL = PREFIX + 'shell-v3';
+const SHELL = PREFIX + 'shell-v4';
 const RUNTIME = PREFIX + 'runtime-v1';
 const OWNED = [SHELL, RUNTIME]; // 이 워커가 관리하는 캐시 (data-*, meta 는 페이지 담당)
 

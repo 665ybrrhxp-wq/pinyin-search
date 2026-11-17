@@ -176,13 +176,17 @@ function renderHistory() {
   }
   el.hidden = false;
   el.innerHTML =
-    `<span class="row-label">최근</span>` +
+    `<span class="row-label" title="검색 기록은 이 기기(브라우저)에만 저장되고 서버로 보내지 않아요">최근 · 이 기기에만</span>` +
     list.map((q) => `<button type="button" class="chip history" data-q="${esc(q)}">${esc(q)}</button>`).join('') +
     `<button type="button" class="chip" data-clear-history title="기록 지우기">✕ 지우기</button>`;
 }
 
 /* ================= 검색 ================= */
-async function search(q, { push = true, offset = 0 } = {}) {
+/**
+ * record: 검색 기록(이 기기 localStorage)에 남길지. 직접 입력·선택한 검색만 남기고,
+ * 링크(?q=)로 열기·새로고침·뒤로 가기(push=false)와 예시 칩은 남기지 않는다.
+ */
+async function search(q, { push = true, offset = 0, record = push } = {}) {
   q = String(q || '').trim();
   if (!q) return;
   const token = ++state.token; // 늦게 도착한 이전 검색 결과는 버림
@@ -212,7 +216,7 @@ async function search(q, { push = true, offset = 0 } = {}) {
     if (offset === 0) {
       results.innerHTML = '';
       renderStatus(data);
-      saveHistory(q);
+      if (record) saveHistory(q);
     }
     if (offset === 0 && data.char) {
       results.appendChild(charCard(data.char));
@@ -773,6 +777,8 @@ function init() {
     if (!t) return;
     if (t.matches('[data-clear-history]')) return clearHistory();
     if (t.matches('[data-retry]')) return start();
+    // 예시 칩은 내가 찾은 검색이 아니므로 기록에 남기지 않음
+    if (t.dataset.q && t.closest('#examples')) return search(t.dataset.q, { record: false });
     if (t.dataset.q && !t.closest('.drawer')) return search(t.dataset.q);
     if (t.dataset.q && t.closest('.drawer')) {
       closeDrawer();
