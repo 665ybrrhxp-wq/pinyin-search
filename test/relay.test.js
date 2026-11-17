@@ -4,6 +4,8 @@ const { after, afterEach, before, beforeEach, describe, test } = require('node:t
 const assert = require('node:assert/strict');
 
 const GEMINI_BASE = 'https://gemini.test';
+const CLAUDE_BASE = 'https://claude.test';
+const CLAUDE_MODEL = 'claude-opus-5-5';
 const MODEL = 'gemini-9.0-flash'; // 고정 설정(GEMINI_MODEL)으로 쓰는 시험용 모델
 const PLAN = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
 const ORIGIN = 'https://665ybrrhxp-wq.github.io';
@@ -61,6 +63,24 @@ function successResponse() {
   });
 }
 
+function claudeSuccessResponse(overrides = {}) {
+  return jsonResponse({
+    id: 'msg_test',
+    type: 'message',
+    role: 'assistant',
+    model: CLAUDE_MODEL,
+    content: [{ type: 'text', text: TRANSCRIPTION }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 1200, output_tokens: 40 },
+    ...overrides,
+  });
+}
+
+function claudeErrorResponse(status, type, message) {
+  return jsonResponse({ type: 'error', error: { type, message } }, status);
+}
+
 // Keep this suite sequential: fetch and the worker's model cache are shared.
 describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
   let worker;
@@ -68,6 +88,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
   let requests;
   let unexpectedRequests;
   let generate;
+  let claude;
 
   before(async () => {
     originalFetch = globalThis.fetch;
@@ -78,9 +99,10 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
         method: (init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase(),
         headers: new Headers(init.headers || (input instanceof Request ? input.headers : undefined)),
         body: init.body !== undefined ? init.body : input instanceof Request ? await input.text() : null,
-        signal: init.signal,
+        signal: init.signal || (input instanceof Request ? input.signal : undefined),
       };
       requests.push(request);
+      if (url.origin === CLAUDE_BASE) return claude(request);
       // Never delegate to the original fetch, including on an unexpected URL.
       if (url.origin !== GEMINI_BASE) {
         unexpectedRequests.push(request);
@@ -113,6 +135,20 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     requests = [];
     unexpectedRequests = [];
     generate = () => successResponse();
+    claude = (request) => {
+      const url = new URL(request.url);
+      // SDK 1.9.0 sends /v1/messages without a beta query; the beta is a header.
+      if (request.method === 'POST' && url.pathname === '/v1/messages') {
+        return claudeSuccessResponse();
+      }
+      if (request.method === 'GET' && url.pathname === `/v1/models/${CLAUDE_MODEL}`) {
+        return jsonResponse({
+          type: 'model', id: CLAUDE_MODEL, display_name: 'Claude Opus 5.5', created_at: '2026-01-01T00:00:00Z',
+        });
+      }
+      unexpectedRequests.push(request);
+      throw new Error(`Unexpected Claude request: ${request.method} ${url.href}`);
+    };
   });
 
   afterEach(() => {
@@ -127,8 +163,12 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
   const ocr = (settings, password = 'pw-one', body = 'QUJD') =>
     worker.fetch(req('/ocr', { method: 'POST', origin: ORIGIN, password, body }), settings);
   const generatedModels = () => requests
-    .filter((request) => request.method === 'POST')
+    .filter((request) => request.method === 'POST' && new URL(request.url).origin === GEMINI_BASE)
     .map((request) => decodeURIComponent(new URL(request.url).pathname.match(/\/models\/(.*):generateContent$/)[1]));
+  const claudeRequests = () => requests.filter((request) => new URL(request.url).origin === CLAUDE_BASE);
+  const claudeEnv = (overrides = {}) => env({
+    ANTHROPIC_API_KEY: 'a-test', ANTHROPIC_BASE_URL: CLAUDE_BASE, ...overrides,
+  });
 
   async function assertError(response, status, code) {
     const data = await response.json();
@@ -325,7 +365,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.equal(data.text, TRANSCRIPTION);
   });
 
-  for (const [upstreamStatus, status, code] of [[429, 429, 'gemini_quota'], [500, 503, 'gemini_busy'], [400, 502, 'upstream']]) {
+  for (const [upstreamStatus, status, code] of [[429, 429, 'ai_quota'], [500, 503, 'ai_busy'], [400, 502, 'upstream']]) {
     test(`Gemini HTTP ${upstreamStatus} maps to ${status} ${code}`, async () => {
       generate = () => jsonResponse({ error: { message: `Canned HTTP ${upstreamStatus}` } }, upstreamStatus);
       const data = await assertError(await ocr(env({ GEMINI_MODEL: MODEL })), status, code);
@@ -361,7 +401,7 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     const data = await assertError(
       await ocr(env({ GEMINI_MODEL: MODEL, ATTEMPT_TIMEOUT_MS: '80', TOTAL_BUDGET_MS: '150' })),
       503,
-      'gemini_busy',
+      'ai_busy',
     );
     assert.ok(Date.now() - started < 1000, 'respects the total budget');
     assert.ok(generatedModels().length < 3, 'does not try every model after the budget is spent');
@@ -411,5 +451,177 @@ describe('Cloudflare OCR relay (offline)', { concurrency: false }, () => {
     assert.equal(response.status, 200);
     const body = JSON.parse(requests.find((r) => r.method === 'POST').body);
     assert.equal(body.generationConfig.thinkingConfig, undefined);
+  });
+
+  test('Claude primary transcribes JPEG with fallback beta, low effort, and an API-key header', async () => {
+    const response = await ocr(claudeEnv());
+    const data = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(data));
+    assert.equal(data.text, TRANSCRIPTION);
+    assert.equal(data.model, CLAUDE_MODEL);
+    assert.equal(data.finishReason, 'end_turn');
+    assert.deepEqual(generatedModels(), [], 'Gemini must not run after Claude succeeds');
+    assert.equal(claudeRequests().length, 1);
+    const upstream = claudeRequests()[0];
+    assert.equal(upstream.method, 'POST');
+    assert.equal(upstream.url, `${CLAUDE_BASE}/v1/messages`);
+    assert.match(upstream.headers.get('anthropic-beta') || '', /server-side-fallback-2026-07-01/);
+    const body = JSON.parse(upstream.body);
+    assert.equal(body.model, CLAUDE_MODEL);
+    assert.equal(body.max_tokens, 16000);
+    assert.equal(body.fallbacks, 'default');
+    assert.equal(body.output_config.effort, 'low');
+    assert.equal(body.messages.length, 1);
+    assert.equal(body.messages[0].role, 'user');
+    const image = body.messages[0].content.find((block) => block.type === 'image');
+    assert.deepEqual(image.source, { type: 'base64', media_type: 'image/jpeg', data: 'QUJD' });
+    assert.ok(body.messages[0].content.some((block) => block.type === 'text' && block.text.length > 0));
+    assert.ok(!/temperature/.test(upstream.body), 'temperature must not be sent to Claude');
+    // 공식 SDK(1.9.0, API 버전 2026-10-21)는 API 키를 Authorization: Bearer 로 보냄 (client.mjs apiKeyAuth)
+    assert.equal(upstream.headers.get('authorization'), 'Bearer a-test');
+    assert.equal(upstream.headers.get('x-api-key'), null);
+  });
+
+  test('Claude sends configured model and effort overrides', async () => {
+    const model = 'claude-sonnet-5-5';
+    claude = () => claudeSuccessResponse({ model });
+    const response = await ocr(claudeEnv({ CLAUDE_MODEL: model, CLAUDE_EFFORT: 'medium' }));
+    const data = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(data));
+    assert.equal(data.model, model);
+    assert.equal(claudeRequests().length, 1);
+    const body = JSON.parse(claudeRequests()[0].body);
+    assert.equal(body.model, model);
+    assert.equal(body.output_config.effort, 'medium');
+    assert.deepEqual(generatedModels(), []);
+  });
+
+  for (const [status, type, message] of [
+    [529, 'overloaded_error', 'Overloaded'],
+    [401, 'authentication_error', 'Invalid API key'],
+  ]) {
+    test(`Claude HTTP ${status} falls back to Gemini without an SDK retry`, async () => {
+      claude = () => claudeErrorResponse(status, type, message);
+      const response = await ocr(claudeEnv());
+      const data = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(data));
+      assert.equal(data.text, TRANSCRIPTION);
+      assert.match(data.model, /^gemini-/);
+      assert.equal(claudeRequests().length, 1, 'maxRetries: 0 must disable SDK retries');
+      assert.deepEqual(generatedModels(), [data.model]);
+      assert.equal(new URL(requests[0].url).origin, CLAUDE_BASE, 'Claude must be tried first');
+      assert.equal(data.usage.user.used, 1);
+    });
+  }
+
+  test('Claude refusal stops provider fallback and refunds usage', async () => {
+    claude = () => claudeSuccessResponse({ stop_reason: 'refusal' });
+    const settings = claudeEnv();
+    const data = await assertError(await ocr(settings), 422, 'refused');
+    assert.deepEqual(generatedModels(), [], 'A refused image must not be sent to Gemini');
+    assert.equal(claudeRequests().length, 1);
+    assert.equal(data.usage.user.used, 0);
+    assert.equal(data.usage.total.used, 0);
+    const usage = await worker.fetch(req('/usage', { password: 'pw-one' }), settings);
+    assert.deepEqual((await usage.json()).usage, data.usage, 'Refund must be persisted');
+  });
+
+  for (const [upstreamStatus, type, message, status, code] of [
+    [529, 'overloaded_error', 'Overloaded', 503, 'ai_busy'],
+    [429, 'rate_limit_error', 'Rate limited', 429, 'ai_quota'],
+  ]) {
+    test(`Claude-only HTTP ${upstreamStatus} returns ${status} ${code} with a refund`, async () => {
+      claude = () => claudeErrorResponse(upstreamStatus, type, message);
+      const data = await assertError(await ocr(claudeEnv({ AI_PROVIDERS: 'claude' })), status, code);
+      assert.equal(claudeRequests().length, 1);
+      assert.deepEqual(generatedModels(), []);
+      assert.equal(data.usage.user.used, 0);
+      assert.equal(data.usage.total.used, 0);
+    });
+  }
+
+  test('provider order gemini,claude tries Gemini first and stops on success', async () => {
+    const response = await ocr(claudeEnv({ AI_PROVIDERS: 'gemini,claude' }));
+    const data = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(data));
+    assert.match(data.model, /^gemini-/);
+    assert.deepEqual(generatedModels(), [data.model]);
+    assert.deepEqual(claudeRequests(), []);
+  });
+
+  test('GET /usage works with only an Anthropic key configured', async () => {
+    const response = await worker.fetch(req('/usage', { password: 'pw-one' }), claudeEnv({ GEMINI_API_KEY: '' }));
+    const data = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(data));
+    assert.equal(data.user, 'me');
+    assert.equal(data.usage.user.used, 0);
+    assert.equal(requests.length, 0);
+  });
+
+  test('GET /usage returns not_configured when neither provider has a key', async () => {
+    await assertError(await worker.fetch(req('/usage', { password: 'pw-one' }), env({
+      ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '',
+    })), 503, 'not_configured');
+    assert.equal(requests.length, 0);
+  });
+
+  test('GET /health checks the Claude model and reports providers without secrets', async () => {
+    const settings = claudeEnv();
+    const response = await worker.fetch(req('/health'), settings);
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    const data = JSON.parse(text);
+    assert.deepEqual(data.providers, ['claude', 'gemini']);
+    assert.equal(data.claude.model, CLAUDE_MODEL);
+    assert.equal(data.claude.keyCheck.ok, true);
+    assert.equal(data.claude.keyCheck.displayName, 'Claude Opus 5.5');
+    for (const secret of [settings.ANTHROPIC_API_KEY, settings.GEMINI_API_KEY, settings.ACCESS_PASSWORDS, 'pw-one', 'pw-two']) {
+      assert.ok(!text.includes(secret), `Health response must not contain secret ${secret}`);
+    }
+    assert.equal(claudeRequests().length, 1);
+    assert.equal(claudeRequests()[0].method, 'GET');
+    assert.equal(claudeRequests()[0].url, `${CLAUDE_BASE}/v1/models/${CLAUDE_MODEL}`);
+    assert.equal(requests.length, 2, 'Health must check both providers');
+  });
+
+  test('GET /health reports Claude model authentication failure', async () => {
+    claude = () => claudeErrorResponse(401, 'authentication_error', 'Invalid API key');
+    const response = await worker.fetch(req('/health'), claudeEnv());
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    const data = JSON.parse(text);
+    assert.deepEqual(data.providers, ['claude', 'gemini']);
+    assert.equal(data.claude.model, CLAUDE_MODEL);
+    assert.equal(data.claude.keyCheck.ok, false);
+    assert.equal(data.claude.keyCheck.status, 401);
+    assert.equal(claudeRequests().length, 1);
+    assert.equal(claudeRequests()[0].method, 'GET');
+    assert.equal(claudeRequests()[0].url, `${CLAUDE_BASE}/v1/models/${CLAUDE_MODEL}`);
+    for (const secret of ['a-test', 'k-test', 'pw-one', 'pw-two']) assert.ok(!text.includes(secret));
+  });
+
+  test('Claude-only timeout aborts fetch quickly and refunds usage', { timeout: 1500 }, async () => {
+    let aborted = false;
+    claude = (request) => {
+      assert.ok(request.signal instanceof AbortSignal, 'SDK must forward its timeout AbortSignal');
+      return new Promise((_, reject) => {
+        const abort = () => {
+          aborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        if (request.signal.aborted) abort();
+        else request.signal.addEventListener('abort', abort, { once: true });
+      });
+    };
+    const started = Date.now();
+    const data = await assertError(await ocr(claudeEnv({
+      CLAUDE_TIMEOUT_MS: '80', AI_PROVIDERS: 'claude',
+    })), 503, 'ai_busy');
+    assert.ok(Date.now() - started < 1000, 'Claude timeout must finish within about one second');
+    assert.ok(aborted, 'The hanging fetch must reject only after the SDK aborts it');
+    assert.equal(claudeRequests().length, 1);
+    assert.deepEqual(generatedModels(), []);
+    assert.equal(data.usage.user.used, 0);
+    assert.equal(data.usage.total.used, 0);
   });
 });
