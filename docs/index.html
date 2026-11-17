@@ -34,7 +34,9 @@
       <input id="q" name="q" type="search" spellcheck="false" autocapitalize="off" autocorrect="off" enterkeyhint="search"
              placeholder="병음 입력 — ben zi, xihuan, xi3 huan, 喜欢"
              aria-label="병음 또는 한자 검색어">
+      <button type="button" class="cam-btn" id="ocr-btn" aria-label="사진에서 한자 찾기" title="사진에서 한자 찾기">📷</button>
       <button type="submit" class="search-btn">검색</button>
+      <input type="file" id="ocr-file" accept="image/*" hidden>
     </form>
 
     <div class="chips-row" id="examples">
@@ -67,6 +69,15 @@
     <div id="drawer-body" class="drawer-body"></div>
   </aside>
 
+  <div id="ocr-scrim" class="scrim" hidden></div>
+  <aside id="ocr" class="drawer" hidden aria-labelledby="ocr-title" role="dialog" aria-modal="true">
+    <div class="drawer-head">
+      <h2 id="ocr-title">사진에서 한자 찾기</h2>
+      <button type="button" class="icon-btn" id="ocr-close" aria-label="닫기">✕</button>
+    </div>
+    <div id="ocr-body" class="drawer-body"></div>
+  </aside>
+
   <footer class="foot">
     <p>
       데이터(가공해서 사용): <a href="https://www.mdbg.net/chinese/dictionary?page=cc-cedict" target="_blank" rel="noopener">CC-CEDICT</a> (CC BY-SA 4.0) ·
@@ -88,5 +99,6 @@
   <script src="lib/dict.js" defer></script>
   <script src="lib/service.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="lib/ocr.js" defer></script>
 </body>
 </html>

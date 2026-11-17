@@ -16,6 +16,7 @@
 | jieba `dict.txt` | [fxsjy/jieba](https://github.com/fxsjy/jieba) | MIT (`licenses/jieba-LICENSE.txt`) | 단어 빈도 (`freq.json`) | CC-CEDICT 표제어만 추림 |
 | 214부수 한국어 이름표 | 한국어 위키백과 「[부수](https://ko.wikipedia.org/wiki/부수)」, Unicode `CJKRadicals.txt` 등을 정리 | CC BY-SA 4.0 (위키백과 유래 부분) | 부수 이름·변형 (`docs/lib/radicals.json`) | 표로 재구성 |
 | Hanzi Writer 3.7.3 | [chanind/hanzi-writer](https://github.com/chanind/hanzi-writer) | MIT (`docs/vendor/hanzi-writer-LICENSE.txt`) | 획순 애니메이션 (`docs/vendor/hanzi-writer.min.js`) | 그대로 사용 |
+| Tesseract.js 5.1.1 + 중국어·한국어 인식 데이터 | [naptha/tesseract.js](https://github.com/naptha/tesseract.js), [tesseract-ocr/tessdata](https://github.com/tesseract-ocr/tessdata) | Apache-2.0 | 📷 사진 속 한자 인식 (CDN 에서 불러옴, 저장소에는 없음) | — |
 | hanzi-writer-data 2.0.1 | [chanind/hanzi-writer-data](https://github.com/chanind/hanzi-writer-data) | Arphic Public License | 획순 데이터 (CDN 에서 불러옴, 저장소에는 없음) | — |
 
 무료 API(Google 입력 도구·번역·TTS, MyMemory)의 결과는 사용자 기기에서 화면에 보여 주고 그 기기에만 캐시할 뿐,
