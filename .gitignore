@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .cache/
+.wrangler/
+relay/node_modules/
+.dev.vars

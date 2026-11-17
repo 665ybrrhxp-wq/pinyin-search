@@ -1,0 +1,288 @@
+/**
+ * 병음 사전 — 사진 속 한자 AI 인식 중계 서버 (Cloudflare Worker)
+ *
+ *   브라우저(병음 사전) ──비밀번호──▶ 이 Worker ──Gemini 키──▶ Google Gemini API
+ *
+ * Gemini API 키는 이 Worker 의 비밀값으로만 존재하고, 공개 사이트 코드에는 들어가지 않는다.
+ * 아는 사람만 쓰도록 비밀번호를 확인하고, 하루 사용량(전체·사람별)에 상한을 둔다.
+ * 사진은 저장하지 않는다 (Gemini 로 전달만 함).
+ *
+ * 비밀값 (npx wrangler secret put …)
+ *   GEMINI_API_KEY    Google AI Studio 에서 받은 키
+ *   ACCESS_PASSWORDS  "이름:비밀번호,이름:비밀번호" (이름 없이 "비밀번호" 하나만 써도 됨)
+ * 설정값 (wrangler.toml [vars])
+ *   ALLOWED_ORIGINS, DAILY_LIMIT_TOTAL, DAILY_LIMIT_PER_USER, GEMINI_MODEL(비우면 자동 선택), MAX_IMAGE_BASE64
+ * 저장소 (wrangler.toml [[kv_namespaces]])
+ *   OCR_USAGE         하루 사용량 카운터 (3일 뒤 자동 삭제)
+ *
+ * 주소
+ *   GET  /health   설정 상태·사용 모델 확인 (비밀번호 불필요, 비밀값은 내보내지 않음)
+ *   GET  /usage    비밀번호 확인 + 오늘 남은 횟수
+ *   POST /ocr      본문 = JPEG 의 base64 문자열(text/plain), 헤더 X-Access-Password
+ */
+
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
+const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+const PROMPT =
+  'Transcribe every Chinese character (simplified or traditional) visible in this image exactly as written, ' +
+  'keeping the original line breaks and Chinese punctuation. Include handwriting. ' +
+  'Skip any Korean or English text. Do not translate, explain, add pinyin, or use markdown. ' +
+  'If there is no Chinese text, output nothing.';
+
+let cachedModel = null; // 같은 인스턴스 안에서 고른 모델을 기억
+
+/* ---------------- 공통 ---------------- */
+function num(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function json(obj, status, headers) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers },
+  });
+}
+
+function allowedOrigin(origin, env) {
+  if (!origin) return null;
+  const list = String(env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.includes(origin) ? origin : null;
+}
+
+function corsHeaders(origin) {
+  const h = { Vary: 'Origin' };
+  if (origin) {
+    h['Access-Control-Allow-Origin'] = origin;
+    h['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+    h['Access-Control-Allow-Headers'] = 'Content-Type, X-Access-Password';
+    h['Access-Control-Max-Age'] = '86400';
+  }
+  return h;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ---------------- 비밀번호 ---------------- */
+function parsePasswords(env) {
+  return String(env.ACCESS_PASSWORDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry, i) => {
+      const at = entry.indexOf(':');
+      if (at > 0 && at < entry.length - 1) return { label: entry.slice(0, at).trim(), password: entry.slice(at + 1) };
+      return { label: `user${i + 1}`, password: entry };
+    });
+}
+
+async function sha256(text) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+}
+
+/** 시간 차로 비밀번호를 짐작하지 못하게, 해시끼리 끝까지 비교 */
+async function sameSecret(a, b) {
+  const [x, y] = await Promise.all([sha256(a), sha256(b)]);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+/** 맞는 비밀번호면 그 사람 이름(사용량 구분용), 아니면 null */
+async function authenticate(request, env) {
+  const given = request.headers.get('X-Access-Password') || '';
+  if (!given) return null;
+  let found = null;
+  for (const p of parsePasswords(env)) {
+    if ((await sameSecret(given, p.password)) && !found) found = p.label;
+  }
+  return found;
+}
+
+/* ---------------- 하루 사용량 ---------------- */
+/** 한국 날짜 (KST) */
+function today() {
+  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+async function readUsage(env, user) {
+  const d = today();
+  const [total, mine] = await Promise.all([env.OCR_USAGE.get(`${d}:all`), env.OCR_USAGE.get(`${d}:u:${user}`)]);
+  return {
+    total: { used: Number(total) || 0, limit: num(env.DAILY_LIMIT_TOTAL, 100) },
+    user: { used: Number(mine) || 0, limit: num(env.DAILY_LIMIT_PER_USER, 20) },
+  };
+}
+
+async function countUse(env, user, usage) {
+  const d = today();
+  const opts = { expirationTtl: 3 * 24 * 3600 };
+  await Promise.all([
+    env.OCR_USAGE.put(`${d}:all`, String(usage.total.used + 1), opts),
+    env.OCR_USAGE.put(`${d}:u:${user}`, String(usage.user.used + 1), opts),
+  ]);
+  return {
+    total: { ...usage.total, used: usage.total.used + 1 },
+    user: { ...usage.user, used: usage.user.used + 1 },
+  };
+}
+
+/* ---------------- Gemini ---------------- */
+class UpstreamError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** 사용할 모델: 설정값 → 이전에 고른 것 → 목록에서 가장 새 Flash 계열 자동 선택 */
+async function resolveModel(env) {
+  if (env.GEMINI_MODEL) return env.GEMINI_MODEL;
+  if (cachedModel) return cachedModel;
+  try {
+    const res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models?pageSize=1000`, {
+      headers: { 'x-goog-api-key': env.GEMINI_API_KEY },
+    });
+    const data = await res.json();
+    const names = (data.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => String(m.name || '').replace(/^models\//, ''))
+      .filter((n) => /gemini/i.test(n) && !/(tts|image|embedding|aqa|live|audio|computer|robotics|thinking|exp)/i.test(n));
+    const version = (n) => Number((/gemini-(\d+(?:\.\d+)?)/i.exec(n) || [])[1]) || 0;
+    const rank = (n) =>
+      (/flash/i.test(n) ? 1000 : 0) + (/lite/i.test(n) ? -300 : 0) + (/preview/i.test(n) ? -100 : 0) + version(n) * 10;
+    names.sort((a, b) => rank(b) - rank(a));
+    if (names[0]) return (cachedModel = names[0]);
+  } catch {
+    /* 목록을 못 받으면 기본 별칭 사용 */
+  }
+  return FALLBACK_MODELS[0];
+}
+
+async function callGemini(env, base64) {
+  const first = await resolveModel(env);
+  const models = [...new Set([first, ...FALLBACK_MODELS])];
+  // 큰 base64 문자열을 다시 JSON 으로 만들지 않고 이어 붙임 (무료 플랜 CPU 시간 절약)
+  const body =
+    '{"contents":[{"parts":[{"text":' +
+    JSON.stringify(PROMPT) +
+    '},{"inline_data":{"mime_type":"image/jpeg","data":"' +
+    base64 +
+    '"}}]}],"generationConfig":{"temperature":0,"maxOutputTokens":2048}}';
+  let lastErr = null;
+  for (const model of models) {
+    const res = await fetch(`${env.GEMINI_BASE || GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+      body,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404) {
+      lastErr = new UpstreamError(404, `모델 ${model} 을(를) 찾을 수 없어요`);
+      if (cachedModel === model) cachedModel = null;
+      continue; // 모델 이름이 바뀌었으면 다음 후보로
+    }
+    if (!res.ok) throw new UpstreamError(res.status, (data.error && data.error.message) || `HTTP ${res.status}`);
+    const cand = (data.candidates || [])[0];
+    if (!cand) {
+      const reason = data.promptFeedback && data.promptFeedback.blockReason;
+      throw new UpstreamError(502, reason ? `Gemini 가 사진을 거부했어요 (${reason})` : 'Gemini 응답이 비어 있어요');
+    }
+    const text = ((cand.content && cand.content.parts) || [])
+      .map((p) => p.text || '')
+      .join('')
+      .trim();
+    cachedModel = model;
+    return { text, model, finishReason: cand.finishReason || null };
+  }
+  throw lastErr || new UpstreamError(502, 'Gemini 를 호출하지 못했어요');
+}
+
+/* ---------------- 요청 처리 ---------------- */
+async function handle(request, env, cors) {
+  const url = new URL(request.url);
+
+  if (url.pathname === '/health' && request.method === 'GET') {
+    return json(
+      {
+        ok: true,
+        configured: {
+          geminiKey: !!env.GEMINI_API_KEY,
+          passwords: parsePasswords(env).length,
+          usageStore: !!env.OCR_USAGE,
+        },
+        model: env.GEMINI_API_KEY ? await resolveModel(env) : null,
+      },
+      200,
+      cors,
+    );
+  }
+
+  if (!env.GEMINI_API_KEY || !env.OCR_USAGE || !parsePasswords(env).length) {
+    return json({ error: '중계 서버 설정이 끝나지 않았어요 (키·비밀번호·KV 확인)', code: 'not_configured' }, 503, cors);
+  }
+
+  if (url.pathname === '/usage' && request.method === 'GET') {
+    const user = await authenticate(request, env);
+    if (!user) {
+      await sleep(600); // 비밀번호 마구 넣어 보기 늦추기
+      return json({ error: '비밀번호가 맞지 않아요', code: 'auth' }, 401, cors);
+    }
+    return json({ user, usage: await readUsage(env, user) }, 200, cors);
+  }
+
+  if (url.pathname === '/ocr' && request.method === 'POST') {
+    const user = await authenticate(request, env);
+    if (!user) {
+      await sleep(600);
+      return json({ error: '비밀번호가 맞지 않아요', code: 'auth' }, 401, cors);
+    }
+    const base64 = (await request.text()).trim();
+    if (!base64) return json({ error: '사진이 비어 있어요', code: 'bad_image' }, 400, cors);
+    if (base64.length > num(env.MAX_IMAGE_BASE64, 4000000)) {
+      return json({ error: '사진이 너무 커요', code: 'too_large' }, 413, cors);
+    }
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) return json({ error: '사진 형식이 올바르지 않아요', code: 'bad_image' }, 400, cors);
+
+    let usage = await readUsage(env, user);
+    if (usage.total.used >= usage.total.limit) {
+      return json({ error: '오늘 전체 AI 사용 한도를 다 썼어요. 내일 다시 써 주세요.', code: 'limit_total', usage }, 429, cors);
+    }
+    if (usage.user.used >= usage.user.limit) {
+      return json({ error: `오늘 쓸 수 있는 AI 횟수(${usage.user.limit}회)를 다 썼어요.`, code: 'limit_user', usage }, 429, cors);
+    }
+    usage = await countUse(env, user, usage); // 호출 전에 셈 (실패해도 되돌리지 않음 — 남용 방지)
+
+    try {
+      const r = await callGemini(env, base64);
+      return json({ text: r.text, model: r.model, finishReason: r.finishReason, usage }, 200, cors);
+    } catch (err) {
+      if (err instanceof UpstreamError && err.status === 429) {
+        return json({ error: 'Gemini 무료 한도를 다 썼어요. 잠시 뒤나 내일 다시 써 주세요.', code: 'gemini_quota', usage }, 429, cors);
+      }
+      const status = err instanceof UpstreamError ? err.status : 0;
+      return json({ error: `Gemini 오류: ${err.message}`, code: 'upstream', upstreamStatus: status, usage }, 502, cors);
+    }
+  }
+
+  return json({ error: '없는 주소예요', code: 'not_found' }, 404, cors);
+}
+
+export default {
+  async fetch(request, env) {
+    const origin = request.headers.get('Origin');
+    const allowed = allowedOrigin(origin, env);
+    const cors = corsHeaders(allowed);
+    if (request.method === 'OPTIONS') return new Response(null, { status: allowed ? 204 : 403, headers: cors });
+    // 브라우저에서 온 요청은 병음 사전 사이트에서만 허용 (curl 등은 비밀번호로 막음)
+    if (origin && !allowed) return json({ error: '허용되지 않은 사이트예요', code: 'origin' }, 403, cors);
+    try {
+      return await handle(request, env, cors);
+    } catch (err) {
+      return json({ error: `중계 서버 오류: ${err.message}`, code: 'internal' }, 500, cors);
+    }
+  },
+};

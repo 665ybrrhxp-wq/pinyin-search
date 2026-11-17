@@ -1,0 +1,10 @@
+{
+  "name": "pinyin-ocr-relay",
+  "private": true,
+  "type": "module",
+  "description": "병음 사전 사진 AI 인식 중계 서버 (Cloudflare Worker → Gemini)",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  }
+}

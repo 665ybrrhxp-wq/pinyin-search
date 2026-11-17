@@ -9,6 +9,11 @@
 'use strict';
 
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+// AI 인식 중계 서버(relay/, Cloudflare Worker) 주소. 비어 있으면 'AI로 읽기' 버튼을 숨김.
+const AI_RELAY_URL = '';
+const AI_PASS_KEY = 'pinyin-search:ai-pass'; // 이 기기에만 저장되는 AI 사용 비밀번호
+const AI_MAX_SIDE = 1600; // AI 로 보낼 사진의 긴 변 (보통 1MB 미만)
+const relayUrl = () => String(window.PINYIN_AI_RELAY || AI_RELAY_URL || '').replace(/\/+$/, '');
 const MAX_SIDE = 1800; // 인식에 넘길 이미지의 긴 변 (휴대폰 사진은 이 크기로 줄임)
 const KEEP_RE = /[㐀-鿿豈-﫿，。！？、；：“”‘’《》（）·…—]/u;
 const HAN_RE = /[㐀-鿿豈-﫿]/u;
@@ -81,11 +86,11 @@ function cleanText(text) {
 }
 
 /* ---------- 이미지 준비 ---------- */
-function regionCanvas() {
+function regionCanvas(maxSide = MAX_SIDE) {
   const img = st.img;
   const c = st.crop || { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight };
   // 큰 사진만 줄이고 키우지는 않음 — 실험상 확대·밝기 보정·여백은 정확도를 높이지 못했음
-  const scale = Math.min(1, MAX_SIDE / Math.max(c.w, c.h));
+  const scale = Math.min(1, maxSide / Math.max(c.w, c.h));
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(c.w * scale));
   canvas.height = Math.max(1, Math.round(c.h * scale));
@@ -127,8 +132,16 @@ function render(file) {
       <label><input type="checkbox" id="ocr-kor"> 한글이 섞인 페이지 (교재 등)</label>
       <button type="button" class="chip" id="ocr-reset">전체 선택</button>
     </div>
-    <button type="button" class="search-btn ocr-go" id="ocr-go">인식하기</button>
+    <div class="ocr-actions">
+      <button type="button" class="search-btn ocr-go" id="ocr-go" title="무료 · 사진이 기기 밖으로 나가지 않음">인식하기</button>
+      ${
+        relayUrl()
+          ? `<button type="button" class="search-btn ocr-go ocr-ai" id="ocr-ai" title="손글씨·어두운 사진도 더 잘 읽음 · 사진이 Google 로 전송됨">✨ AI로 읽기</button>`
+          : ''
+      }
+    </div>
     <p class="status" id="ocr-status" aria-live="polite"></p>
+    <div id="ocr-ai-box"></div>
     <div id="ocr-result"></div>`;
   st.crop = null;
   st.img = $('#ocr-img');
@@ -220,6 +233,109 @@ function showResult(lines) {
     <button type="button" class="search-btn ocr-go" id="ocr-search">이 글자로 검색</button>`;
 }
 
+/* ---------- AI 인식 (중계 서버 → Gemini) ---------- */
+function loadPass() {
+  try {
+    return localStorage.getItem(AI_PASS_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+function savePass(p) {
+  try {
+    if (p) localStorage.setItem(AI_PASS_KEY, p);
+    else localStorage.removeItem(AI_PASS_KEY);
+  } catch {
+    /* 저장 못 해도 이번에는 사용 가능 */
+  }
+}
+let sessionPass = ''; // '기억하기'를 끄면 이 화면에서만 사용
+
+async function relay(path, opts = {}) {
+  let res;
+  try {
+    res = await fetch(relayUrl() + path, { ...opts, credentials: 'omit' });
+  } catch {
+    throw Object.assign(new Error('AI 서버에 연결하지 못했어요 (인터넷 연결 확인)'), { code: 'network' });
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.code, usage: data.usage });
+  return data;
+}
+
+function usageText(u) {
+  if (!u || !u.user) return '';
+  const left = Math.max(0, Math.min(u.user.limit - u.user.used, u.total.limit - u.total.used));
+  return `오늘 남은 AI 횟수 ${left}회`;
+}
+
+/** 비밀번호 입력 화면 (처음 한 번 또는 틀렸을 때) */
+function askPassword(message) {
+  const box = $('#ocr-ai-box');
+  box.innerHTML = `
+    <div class="ocr-ai-form">
+      <p class="ocr-ai-note"><b>✨ AI로 읽기</b>는 고른 부분의 사진을 <b>Google Gemini</b>로 보내 읽어요.
+        무료 사용분이라 Google 이 서비스 개선에 사진을 활용할 수 있으니, 개인정보가 담긴 사진은 보내지 마세요.
+        하루 사용 횟수에 한도가 있어요.</p>
+      ${message ? `<p class="err">${esc(message)}</p>` : ''}
+      <label class="ocr-ai-label">AI 사용 비밀번호
+        <input type="password" id="ocr-ai-pass" autocomplete="off" placeholder="받은 비밀번호">
+      </label>
+      <label class="ocr-ai-remember"><input type="checkbox" id="ocr-ai-remember" checked> 이 기기에 기억하기</label>
+      <button type="button" class="search-btn ocr-go" id="ocr-ai-ok">확인하고 AI로 읽기</button>
+    </div>`;
+  setTimeout(() => $('#ocr-ai-pass') && $('#ocr-ai-pass').focus(), 50);
+}
+
+async function aiRecognize(passFromForm) {
+  if (st.busy || !st.img || !st.img.naturalWidth) return;
+  const pass = passFromForm || sessionPass || loadPass();
+  if (!pass) return askPassword('');
+  st.busy = true;
+  const buttons = ['#ocr-go', '#ocr-ai', '#ocr-ai-ok'].map((s) => $(s)).filter(Boolean);
+  buttons.forEach((b) => (b.disabled = true));
+  setStatus('<span class="loading">AI가 읽는 중… (보통 몇 초)</span>');
+  try {
+    const canvas = regionCanvas(AI_MAX_SIDE);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+    const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+    const t0 = performance.now();
+    const data = await relay('/ocr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', 'X-Access-Password': pass },
+      body: base64,
+    });
+    // 성공한 비밀번호만 기억
+    if (passFromForm) {
+      if ($('#ocr-ai-remember') && $('#ocr-ai-remember').checked) savePass(passFromForm);
+      sessionPass = passFromForm;
+    }
+    $('#ocr-ai-box').innerHTML = `<p class="legend ocr-ai-meta">✨ ${esc(data.model || 'Gemini')} · ${esc(usageText(data.usage))}
+      · <button type="button" class="link-btn" id="ocr-ai-forget">비밀번호 지우기</button></p>`;
+    const lines = cleanText(data.text);
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    if (!lines.length) {
+      setStatus(`<span class="warn">AI도 한자를 찾지 못했어요 (${secs}초).</span>`);
+      $('#ocr-result').innerHTML = '';
+    } else {
+      setStatus(`<span>AI가 ${lines.length}줄을 읽었어요 (${secs}초) · 틀린 글자는 고친 뒤 검색하세요</span>`);
+      showResult(lines);
+    }
+  } catch (err) {
+    if (err.code === 'auth') {
+      savePass('');
+      sessionPass = '';
+      askPassword('비밀번호가 맞지 않아요. 다시 넣어 주세요.');
+      setStatus('');
+    } else {
+      setStatus(`<span class="err">${esc(err.message)}</span>${err.usage ? ` <span class="legend">${esc(usageText(err.usage))}</span>` : ''}`);
+    }
+  } finally {
+    st.busy = false;
+    buttons.forEach((b) => b && (b.disabled = false));
+  }
+}
+
 function searchText(text) {
   const q = String(text || '').replace(/\s+/g, '').slice(0, 80);
   if (!q) return;
@@ -249,6 +365,17 @@ function init() {
     const t = e.target.closest('button');
     if (!t) return;
     if (t.id === 'ocr-go') return recognize();
+    if (t.id === 'ocr-ai') return aiRecognize();
+    if (t.id === 'ocr-ai-ok') {
+      const p = ($('#ocr-ai-pass') && $('#ocr-ai-pass').value.trim()) || '';
+      return p ? aiRecognize(p) : $('#ocr-ai-pass') && $('#ocr-ai-pass').focus();
+    }
+    if (t.id === 'ocr-ai-forget') {
+      savePass('');
+      sessionPass = '';
+      $('#ocr-ai-box').innerHTML = '<p class="legend">이 기기에 저장된 AI 비밀번호를 지웠어요.</p>';
+      return;
+    }
     if (t.id === 'ocr-search') return searchText($('#ocr-text').value);
     if (t.id === 'ocr-reset') {
       st.crop = null;

@@ -1,0 +1,22 @@
+# 병음 사전 — 사진 AI 인식 중계 서버 (Cloudflare Workers 무료 플랜)
+# 비밀값(키·비밀번호)은 여기에 쓰지 말고 `npx wrangler secret put …` 으로 넣을 것 → relay/README.md
+name = "pinyin-ocr-relay"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[vars]
+# 이 주소에서 온 브라우저 요청만 허용 (쉼표로 구분)
+ALLOWED_ORIGINS = "https://665ybrrhxp-wq.github.io,http://localhost:3939"
+# 하루(한국 날짜 기준) 사용 상한 — 모든 사람 합계 / 한 사람당
+DAILY_LIMIT_TOTAL = "100"
+DAILY_LIMIT_PER_USER = "20"
+# 비워 두면 키로 쓸 수 있는 최신 Flash 모델을 자동으로 고름 (예: "gemini-flash-latest" 로 고정 가능)
+GEMINI_MODEL = ""
+# 사진(base64) 최대 길이 — 앱은 1600px JPEG 로 줄여 보내므로 보통 1MB 미만
+MAX_IMAGE_BASE64 = "4000000"
+
+# 하루 사용량 카운터. 처음 한 번: npx wrangler kv namespace create OCR_USAGE → 나온 id 로 교체
+[[kv_namespaces]]
+binding = "OCR_USAGE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
