@@ -277,9 +277,9 @@ function askPassword(message) {
   const box = $('#ocr-ai-box');
   box.innerHTML = `
     <div class="ocr-ai-form">
-      <p class="ocr-ai-note"><b>✨ AI로 읽기</b>는 고른 부분의 사진을 <b>Google Gemini</b>로 보내 읽어요.
-        무료 사용분이라 Google 이 서비스 개선에 사진을 활용할 수 있으니, 개인정보가 담긴 사진은 보내지 마세요.
-        하루 사용 횟수에 한도가 있어요.</p>
+      <p class="ocr-ai-note"><b>✨ AI로 읽기</b>는 고른 부분의 사진을 AI(<b>Claude</b>, 붐빌 때는 <b>Google Gemini</b>)로 보내 읽어요.
+        사진은 저장하지 않지만, Gemini 무료 사용분으로 처리될 때는 Google 이 서비스 개선에 활용할 수 있으니
+        개인정보가 담긴 사진은 보내지 마세요. 하루 사용 횟수에 한도가 있어요.</p>
       ${message ? `<p class="err">${esc(message)}</p>` : ''}
       <label class="ocr-ai-label">AI 사용 비밀번호
         <input type="password" id="ocr-ai-pass" autocomplete="off" placeholder="받은 비밀번호">

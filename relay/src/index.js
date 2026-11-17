@@ -1,18 +1,20 @@
 /**
  * 병음 사전 — 사진 속 한자 AI 인식 중계 서버 (Cloudflare Worker)
  *
- *   브라우저(병음 사전) ──비밀번호──▶ 이 Worker ──Gemini 키──▶ Google Gemini API
+ *   브라우저(병음 사전) ──비밀번호──▶ 이 Worker ──API 키──▶ Claude (주) / Google Gemini (예비)
  *
- * Gemini API 키는 이 Worker 의 비밀값으로만 존재하고, 공개 사이트 코드에는 들어가지 않는다.
+ * API 키는 이 Worker 의 비밀값으로만 존재하고, 공개 사이트 코드에는 들어가지 않는다.
  * 아는 사람만 쓰도록 비밀번호를 확인하고, 하루 사용량(전체·사람별)에 상한을 둔다.
- * 사진은 저장하지 않는다 (Gemini 로 전달만 함).
+ * 사진은 저장하지 않는다 (AI 로 전달만 함).
  *
  * 비밀값 (npx wrangler secret put …)
- *   GEMINI_API_KEY    Google AI Studio 에서 받은 키
+ *   ANTHROPIC_API_KEY Claude Console 에서 받은 키 (있으면 Claude 가 먼저 읽음)
+ *   GEMINI_API_KEY    Google AI Studio 에서 받은 키 (Claude 가 바쁘거나 실패할 때 예비)
  *   ACCESS_PASSWORDS  "이름:비밀번호,이름:비밀번호" (이름 없이 "비밀번호" 하나만 써도 됨)
  * 설정값 (wrangler.toml [vars])
- *   ALLOWED_ORIGINS, DAILY_LIMIT_TOTAL, DAILY_LIMIT_PER_USER, GEMINI_MODEL(비우면 MODEL_PLAN 순서), MAX_IMAGE_BASE64,
- *   ATTEMPT_TIMEOUT_MS(모델당, 기본 25초), TOTAL_BUDGET_MS(전체, 기본 55초)
+ *   AI_PROVIDERS(시도 순서, 기본 "claude,gemini"), CLAUDE_MODEL(기본 claude-opus-5-5), CLAUDE_EFFORT(기본 low),
+ *   CLAUDE_TIMEOUT_MS(기본 45초), ALLOWED_ORIGINS, DAILY_LIMIT_TOTAL, DAILY_LIMIT_PER_USER,
+ *   GEMINI_MODEL(비우면 MODEL_PLAN 순서), MAX_IMAGE_BASE64, ATTEMPT_TIMEOUT_MS(Gemini 모델당 25초), TOTAL_BUDGET_MS(전체 55초)
  * 저장소 (wrangler.toml [[kv_namespaces]])
  *   OCR_USAGE         하루 사용량 카운터 (3일 뒤 자동 삭제)
  *
@@ -21,8 +23,18 @@
  *   GET  /usage    비밀번호 확인 + 오늘 남은 횟수
  *   POST /ocr      본문 = JPEG 의 base64 문자열(text/plain), 헤더 X-Access-Password
  */
+import Anthropic, {
+  APIConnectionError,
+  APIConnectionTimeoutError,
+  AuthenticationError,
+  BadRequestError,
+  InternalServerError,
+  PermissionDeniedError,
+  RateLimitError,
+} from '@anthropic-ai/sdk';
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
+const CLAUDE_DEFAULT_MODEL = 'claude-opus-5-5';
 const PROMPT =
   'Transcribe every Chinese character (simplified or traditional) visible in this image exactly as written, ' +
   'keeping the original line breaks and Chinese punctuation. Include handwriting. ' +
@@ -185,11 +197,12 @@ async function candidateModels(env) {
 /** 응답이 늦거나 붐빔(과부하·일시 오류)으로 볼 상태 */
 const BUSY = new Set([500, 502, 503, 504, 524]);
 
-async function callGemini(env, base64) {
+async function callGemini(env, base64, budgetLimitMs = Infinity) {
   const models = await candidateModels(env);
   const started = Date.now();
   const attemptMs = num(env.ATTEMPT_TIMEOUT_MS, 25000); // 모델 하나를 기다리는 최대 시간
-  const budgetMs = num(env.TOTAL_BUDGET_MS, 55000); // 전체 최대 대기 (사용자가 1분 넘게 기다리지 않게)
+  // 전체 최대 대기 (사용자가 1분 넘게 기다리지 않게) — Claude 를 먼저 시도했으면 남은 시간만
+  const budgetMs = Math.min(num(env.TOTAL_BUDGET_MS, 55000), budgetLimitMs);
   const minLeft = Math.min(8000, attemptMs / 3);
   // 큰 base64 문자열을 다시 JSON 으로 만들지 않고 이어 붙임 (무료 플랜 CPU 시간 절약)
   // temperature 는 3.x 에서 샘플링 설정이 제거되어 400 이 날 수 있어 보내지 않음
@@ -259,6 +272,103 @@ async function callGemini(env, base64) {
   throw lastErr || new UpstreamError(503, 'Gemini 가 제시간에 응답하지 않았어요');
 }
 
+/* ---------------- Claude (Anthropic) ---------------- */
+function claudeClient(env, timeoutMs) {
+  // 재시도는 이 서버가 공급자를 바꿔 가며 직접 하므로 SDK 자동 재시도는 끔 (대기 시간이 길어지지 않게)
+  return new Anthropic({
+    apiKey: env.ANTHROPIC_API_KEY,
+    baseURL: env.ANTHROPIC_BASE_URL || undefined,
+    maxRetries: 0,
+    timeout: timeoutMs,
+  });
+}
+
+async function callClaude(env, base64, timeoutMs) {
+  const model = env.CLAUDE_MODEL || CLAUDE_DEFAULT_MODEL;
+  const t0 = Date.now();
+  try {
+    const response = await claudeClient(env, timeoutMs).beta.messages.create({
+      model,
+      max_tokens: 16000,
+      // 안전 분류기가 거절하면 같은 요청을 서버에서 다른 모델로 이어서 처리 (Anthropic 권장 기본값)
+      betas: ['server-side-fallback-2026-07-01'],
+      fallbacks: 'default',
+      // 글자 옮겨 적기는 단순한 일이라 낮은 effort 로 빠르고 저렴하게
+      output_config: { effort: env.CLAUDE_EFFORT || 'low' },
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
+            { type: 'text', text: PROMPT },
+          ],
+        },
+      ],
+    });
+    const u = response.usage || {};
+    // 진단용 로그 — 사진·키·비밀번호는 남기지 않음 (토큰 수는 비용 확인용)
+    console.log(
+      JSON.stringify({ event: 'claude', model: response.model, status: 200, ms: Date.now() - t0, in: u.input_tokens, out: u.output_tokens, stop: response.stop_reason }),
+    );
+    if (response.stop_reason === 'refusal') throw new UpstreamError(422, 'AI 가 이 사진은 읽을 수 없다고 했어요');
+    const text = response.content
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('')
+      .trim();
+    return { text, model: response.model, finishReason: response.stop_reason };
+  } catch (err) {
+    if (err instanceof UpstreamError) throw err;
+    const timedOut = err instanceof APIConnectionTimeoutError;
+    console.log(JSON.stringify({ event: 'claude', model, status: err.status || (timedOut ? 'timeout' : 'network'), ms: Date.now() - t0 }));
+    // 가장 구체적인 오류부터 (OverloadedError·5xx 는 InternalServerError 계열)
+    if (timedOut) throw new UpstreamError(504, 'Claude 응답 시간 초과');
+    if (err instanceof RateLimitError) throw new UpstreamError(429, 'Claude 사용 한도에 걸렸어요');
+    if (err instanceof InternalServerError) throw new UpstreamError(503, 'Claude 서버가 바빠요');
+    if (err instanceof AuthenticationError || err instanceof PermissionDeniedError) {
+      throw new UpstreamError(401, 'Claude API 키를 확인해 주세요');
+    }
+    if (err instanceof BadRequestError) throw new UpstreamError(400, `Claude 요청 오류: ${err.message}`);
+    if (err instanceof APIConnectionError) throw new UpstreamError(502, 'Claude 에 연결하지 못했어요');
+    throw new UpstreamError(502, `Claude 오류: ${err.message}`);
+  }
+}
+
+/* ---------------- 공급자 순서 ---------------- */
+function providerOrder(env) {
+  const has = { claude: !!env.ANTHROPIC_API_KEY, gemini: !!env.GEMINI_API_KEY };
+  return [
+    ...new Set(
+      String(env.AI_PROVIDERS || 'claude,gemini')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter((p) => has[p]),
+    ),
+  ];
+}
+
+/**
+ * 공급자를 차례로 시도: 바쁨·시간 초과·한도·키 문제면 다음 공급자로.
+ * 단 AI 가 내용을 이유로 거절(422)했으면 같은 사진을 다른 곳에 다시 보내지 않음.
+ */
+async function callAI(env, base64) {
+  const started = Date.now();
+  const budget = num(env.TOTAL_BUDGET_MS, 55000);
+  let lastErr = null;
+  for (const p of providerOrder(env)) {
+    const left = budget - (Date.now() - started);
+    if (lastErr && left < 5000) break;
+    try {
+      if (p === 'claude') return await callClaude(env, base64, Math.min(num(env.CLAUDE_TIMEOUT_MS, 45000), left));
+      if (p === 'gemini') return await callGemini(env, base64, left);
+    } catch (err) {
+      if (err instanceof UpstreamError && err.status === 422) throw err;
+      lastErr = err;
+    }
+  }
+  throw lastErr || new UpstreamError(503, 'AI 가 제시간에 응답하지 않았어요');
+}
+
 /* ---------------- 요청 처리 ---------------- */
 async function handle(request, env, cors) {
   const url = new URL(request.url);
@@ -279,6 +389,17 @@ async function handle(request, env, cors) {
         keyCheck = { ok: false, error: err.message };
       }
     }
+    // Claude 키 점검: 모델 정보 조회 (토큰을 쓰지 않음)
+    let claude = null;
+    if (env.ANTHROPIC_API_KEY) {
+      const model = env.CLAUDE_MODEL || CLAUDE_DEFAULT_MODEL;
+      try {
+        const info = await claudeClient(env, 10000).models.retrieve(model);
+        claude = { model, keyCheck: { ok: true, displayName: info.display_name || null } };
+      } catch (err) {
+        claude = { model, keyCheck: { ok: false, status: err.status || null, error: err.message } };
+      }
+    }
     return json(
       {
         ok: true,
@@ -287,6 +408,8 @@ async function handle(request, env, cors) {
           passwords: parsePasswords(env).length,
           usageStore: !!env.OCR_USAGE,
         },
+        providers: providerOrder(env),
+        claude,
         keyCheck,
         model: env.GEMINI_API_KEY ? await resolveModel(env) : null,
       },
@@ -295,7 +418,7 @@ async function handle(request, env, cors) {
     );
   }
 
-  if (!env.GEMINI_API_KEY || !env.OCR_USAGE || !parsePasswords(env).length) {
+  if (!providerOrder(env).length || !env.OCR_USAGE || !parsePasswords(env).length) {
     return json({ error: '중계 서버 설정이 끝나지 않았어요 (키·비밀번호·KV 확인)', code: 'not_configured' }, 503, cors);
   }
 
@@ -331,27 +454,28 @@ async function handle(request, env, cors) {
     usage = await countUse(env, user, usage); // 호출 전에 셈 (실패해도 되돌리지 않음 — 남용 방지)
 
     try {
-      const r = await callGemini(env, base64);
+      const r = await callAI(env, base64);
       return json({ text: r.text, model: r.model, finishReason: r.finishReason, usage }, 200, cors);
     } catch (err) {
-      // Gemini 쪽 실패는 횟수에서 빼 줌 (사용자 잘못이 아니므로)
+      // AI 쪽 실패는 횟수에서 빼 줌 (사용자 잘못이 아니므로)
       usage = await refundUse(env, user, usage).catch(() => usage);
       const status = err instanceof UpstreamError ? err.status : 0;
+      if (status === 422) return json({ error: err.message, code: 'refused', usage }, 422, cors);
       if (status === 429) {
-        return json({ error: 'Gemini 무료 한도를 다 썼어요. 잠시 뒤나 내일 다시 써 주세요.', code: 'gemini_quota', usage }, 429, cors);
+        return json({ error: 'AI 사용 한도에 걸렸어요. 잠시 뒤나 내일 다시 써 주세요.', code: 'ai_quota', usage }, 429, cors);
       }
       if (status === 503 || status === 504) {
         return json(
           {
-            error: "Gemini 서버가 지금 바빠요(응답 지연·과부하). 잠시 뒤 다시 해 보거나 기본 '인식하기'를 써 주세요.",
-            code: 'gemini_busy',
+            error: "AI 서버가 지금 바빠요(응답 지연·과부하). 잠시 뒤 다시 해 보거나 기본 '인식하기'를 써 주세요.",
+            code: 'ai_busy',
             usage,
           },
           503,
           cors,
         );
       }
-      return json({ error: `Gemini 오류: ${err.message}`, code: 'upstream', upstreamStatus: status, usage }, 502, cors);
+      return json({ error: `AI 오류: ${err.message}`, code: 'upstream', upstreamStatus: status, usage }, 502, cors);
     }
   }
 

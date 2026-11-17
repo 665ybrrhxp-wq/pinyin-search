@@ -6,6 +6,13 @@ compatibility_date = "2025-09-01"
 workers_dev = true
 
 [vars]
+# AI 시도 순서 (키가 있는 것만 사용). Claude 가 바쁘거나 실패하면 Gemini 로
+AI_PROVIDERS = "claude,gemini"
+# Claude 모델 — 더 저렴하게: "claude-sonnet-5-5" (약 1/2) 또는 "claude-haiku-5-5" (약 1/40)
+CLAUDE_MODEL = "claude-opus-5-5"
+# 생각 깊이 (low/medium/high) — 글자 옮겨 적기는 low 로 충분하고 빠름
+CLAUDE_EFFORT = "low"
+CLAUDE_TIMEOUT_MS = "45000"
 # 이 주소에서 온 브라우저 요청만 허용 (쉼표로 구분)
 ALLOWED_ORIGINS = "https://665ybrrhxp-wq.github.io,http://localhost:3939"
 # 하루(한국 날짜 기준) 사용 상한 — 모든 사람 합계 / 한 사람당
